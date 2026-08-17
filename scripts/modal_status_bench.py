@@ -1,0 +1,1361 @@
+import csv
+import hashlib
+import json
+import math
+import os
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import modal
+
+APP_NAME = "jaide-status-bench"
+LOCAL_PROJECT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_MOUNT_PATH = Path("/workspace/jaide")
+DATA_MOUNT_PATH = Path("/data")
+CHECKPOINT_MOUNT_PATH = Path("/checkpoints")
+REPORT_MOUNT_PATH = Path("/reports")
+BUILD_MOUNT_PATH = Path("/build_artifacts")
+
+IGNORE_PATTERNS = [
+    ".git",
+    ".zig-cache",
+    "zig-out",
+    ".venv",
+    ".venv-modal",
+    "__pycache__",
+    "*.o",
+    "*.a",
+    "*.bin",
+    ".local",
+    ".cache",
+    ".upm",
+    ".pythonlibs",
+    ".config",
+]
+
+GPU_SPEC = os.environ.get("JAIDE_BENCH_GPU", "B200:1")
+
+
+def _gpu_count_from_spec(spec: str) -> int:
+    parts = spec.rsplit(":", 1)
+    if len(parts) == 1:
+        return 1
+    try:
+        count = int(parts[1])
+    except ValueError as exc:
+        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count") from exc
+    if count <= 0:
+        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count")
+    return count
+
+
+ALLOCATED_GPU_COUNT = _gpu_count_from_spec(GPU_SPEC)
+TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_TIMEOUT", "86400"))
+CPU_TIMEOUT_SEC = int(os.environ.get("JAIDE_CPU_TIMEOUT", "86400"))
+CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
+CPU_LIMIT = float(os.environ.get("JAIDE_BENCH_CPU_LIMIT", "32.0"))
+MEMORY_REQUEST_MB = int(os.environ.get("JAIDE_BENCH_MEMORY_REQUEST", "131072"))
+MEMORY_LIMIT_MB = int(os.environ.get("JAIDE_BENCH_MEMORY_LIMIT", "131072"))
+MODEL_DIM = int(os.environ.get("JAIDE_BENCH_MODEL_DIM", "16384"))
+NUM_LAYERS = int(os.environ.get("JAIDE_BENCH_LAYERS", "11"))
+BATCH_SIZE = int(os.environ.get("JAIDE_BENCH_BATCH", "32"))
+EPOCHS = int(os.environ.get("JAIDE_BENCH_EPOCHS", "1"))
+SAMPLE_CAP = int(os.environ.get("JAIDE_BENCH_SAMPLE_CAP", "500000"))
+MAX_SEQ_LEN = int(os.environ.get("JAIDE_BENCH_MAX_SEQ_LEN", "256"))
+LEARNING_RATE = os.environ.get("JAIDE_BENCH_LR", "0.0003")
+REASONING_CYCLES = int(os.environ.get("JAIDE_BENCH_REASONING_CYCLES", "1"))
+RELATIONAL_PASS_INTERVAL = int(os.environ.get("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL", "10"))
+JAIDE_RELATIONAL_FAST = os.environ.get("JAIDE_RELATIONAL_FAST", "1")
+NUM_GPUS = int(os.environ.get("JAIDE_BENCH_NUM_GPUS", str(ALLOCATED_GPU_COUNT)))
+RECONSTRUCTION_ALPHA = os.environ.get("JAIDE_BENCH_RECONSTRUCTION_ALPHA", "0.3")
+PHASE_A_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_A_STEPS", "500"))
+PHASE_B_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_B_STEPS", "2000"))
+SHUFFLE_TARGET_CONTROL = os.environ.get("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL", "0")
+TARGET_SOURCE_FROZEN = os.environ.get("JAIDE_BENCH_TARGET_SOURCE_FROZEN", "1")
+SPECTRAL_DEPTH_COMPENSATION = os.environ.get("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION", "1")
+INFERENCE_STARTUP_TIMEOUT_SEC = int(os.environ.get("JAIDE_INFERENCE_STARTUP_TIMEOUT", "600"))
+MASTER_ADDR = os.environ.get("JAIDE_BENCH_MASTER_ADDR", "127.0.0.1")
+MASTER_PORT = os.environ.get("JAIDE_BENCH_MASTER_PORT", "29500")
+NCCL_DEBUG = os.environ.get("JAIDE_BENCH_NCCL_DEBUG", "WARN")
+MASTER_IS_LOOPBACK = MASTER_ADDR in {"127.0.0.1", "localhost", "::1"}
+NCCL_IB_DISABLE = os.environ.get("JAIDE_BENCH_NCCL_IB_DISABLE", "1" if MASTER_IS_LOOPBACK else "0")
+NCCL_SOCKET_IFNAME = os.environ.get("JAIDE_BENCH_NCCL_SOCKET_IFNAME", "lo" if MASTER_IS_LOOPBACK else "^lo,docker")
+CUDA_DEVICE_ORDER = os.environ.get("JAIDE_BENCH_CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+DATASET_PATH = os.environ.get("JAIDE_BENCH_DATASET_PATH", "/data/dataset/finephrase_bench.jsonl")
+CHECKPOINT_PATH = os.environ.get("JAIDE_BENCH_CHECKPOINT_PATH", "/checkpoints/tokenizer.vocab")
+VOCAB_SIZE = int(os.environ.get("JAIDE_BENCH_VOCAB_SIZE", "32000"))
+SPECTRAL_NORM_TARGET = os.environ.get("JAIDE_BENCH_SPECTRAL_NORM_TARGET", "0.9")
+SPECTRAL_POWER_ITERATIONS = int(os.environ.get("JAIDE_BENCH_SPECTRAL_POWER_ITERATIONS", "30"))
+SEED_OFFSET = int(os.environ.get("JAIDE_BENCH_SEED_OFFSET", "0"))
+GRAD_MEAN = os.environ.get("JAIDE_BENCH_GRAD_MEAN", "true")
+NORMALIZED_GRADIENT_FLOW = os.environ.get("JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW", "true")
+GRADIENT_CLIP_NORM = os.environ.get("JAIDE_BENCH_GRADIENT_CLIP_NORM", "1.0")
+SFD_TRUST_RATIO = os.environ.get("JAIDE_BENCH_SFD_TRUST_RATIO", "0.1")
+SFD_WEIGHT_FLOOR = os.environ.get("JAIDE_BENCH_SFD_WEIGHT_FLOOR", "0.001")
+SPECTRAL_INTERVAL = int(os.environ.get("JAIDE_BENCH_SPECTRAL_INTERVAL", "10"))
+LOGDET_WEIGHT = os.environ.get("JAIDE_BENCH_LOGDET_WEIGHT", "-0.001")
+CLIP_MIN = os.environ.get("JAIDE_BENCH_CLIP_MIN", "-5.0")
+CLIP_MAX = os.environ.get("JAIDE_BENCH_CLIP_MAX", "5.0")
+CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "7"))
+CHECKPOINT_INTERVAL_EPOCHS = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS", "5"))
+RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
+NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "1") == "1"
+
+app = modal.App(APP_NAME)
+
+data_volume = modal.Volume.from_name("jaide-bench-data", create_if_missing=True)
+checkpoint_volume = modal.Volume.from_name("jaide-bench-checkpoints", create_if_missing=True)
+report_volume = modal.Volume.from_name("jaide-bench-reports", create_if_missing=True)
+build_volume = modal.Volume.from_name("jaide-bench-build", create_if_missing=True)
+
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+        add_python="3.11",
+    )
+    .entrypoint([])
+    .run_commands(
+        "DEBIAN_FRONTEND=noninteractive apt-get update",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages "
+        "git curl xz-utils build-essential wget ca-certificates pkg-config "
+        "libnccl2 libnccl-dev opencl-headers ocl-icd-opencl-dev jq",
+        "rm -rf /var/lib/apt/lists/*",
+    )
+    .pip_install("pyarrow", "requests", "zstandard", "datasets", "huggingface_hub", "hf_xet")
+    .run_commands(
+        "mkdir -p /opt",
+        "curl -fsSL https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz "
+        "| tar -xJ -C /opt",
+        "ln -sf /opt/zig-x86_64-linux-0.14.1/zig /usr/local/bin/zig",
+        "zig version",
+    )
+    .run_commands(
+        "curl -fsSL https://github.com/diku-dk/futhark/releases/download/v0.26.4/"
+        "futhark-0.26.4-linux-x86_64.tar.xz -o /tmp/futhark.tar.xz",
+        "mkdir -p /opt/futhark",
+        "tar -xJf /tmp/futhark.tar.xz -C /opt/futhark --strip-components=1",
+        "ln -sf /opt/futhark/bin/futhark /usr/local/bin/futhark",
+        "rm /tmp/futhark.tar.xz",
+        "futhark --version | grep -F '0.26.4' || "
+        "{ echo 'ERROR: futhark version mismatch after install'; exit 1; }",
+    )
+    .env(
+        {
+            "PATH": "/opt/zig-x86_64-linux-0.14.1:/opt/futhark/bin:"
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs",
+            "HF_HOME": "/data/hf_home",
+            "HF_DATASETS_CACHE": "/data/hf_datasets_cache",
+            "HF_XET_HIGH_PERFORMANCE": "1",
+        }
+    )
+    .add_local_dir(
+        str(LOCAL_PROJECT_DIR),
+        remote_path=str(PROJECT_MOUNT_PATH),
+        ignore=IGNORE_PATTERNS,
+    )
+)
+
+
+def _log(msg: str) -> None:
+    print(f"[bench] {msg}", flush=True)
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _clear_rank_coordination_files(nccl_id_path: str) -> None:
+    """Remove NCCL and filesystem-stage markers left by a previous launch."""
+    base = Path(nccl_id_path)
+    _safe_unlink(base)
+    _safe_unlink(Path(str(base) + ".ready"))
+    try:
+        for marker in base.parent.glob(base.name + ".*"):
+            if marker.is_file() or marker.is_symlink():
+                _safe_unlink(marker)
+    except FileNotFoundError:
+        pass
+
+
+def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _run(
+    cmd: List[str],
+    cwd: str,
+    env: Optional[Dict[str, str]] = None,
+    check: bool = True,
+    timeout: int = 900,
+    input_bytes: Optional[bytes] = None,
+) -> Tuple[int, str, float]:
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if not cmd:
+        raise ValueError("cmd must not be empty")
+    _log(f">>> {' '.join(cmd)}  (cwd={cwd})")
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+    stdin_mode = subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=stdin_mode,
+        bufsize=0,
+        start_new_session=True,
+    )
+    if proc.stdout is None:
+        _terminate_process_group(proc)
+        raise RuntimeError("subprocess stdout pipe was not created")
+    if input_bytes is not None:
+        if proc.stdin is None:
+            _terminate_process_group(proc)
+            raise RuntimeError("subprocess stdin pipe was not created")
+        try:
+            proc.stdin.write(input_bytes)
+            proc.stdin.flush()
+        finally:
+            proc.stdin.close()
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    output_chunks: List[bytes] = []
+    timed_out = False
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                _terminate_process_group(proc)
+                break
+            if proc.poll() is not None:
+                remaining = proc.stdout.read()
+                if remaining:
+                    print(remaining.decode("utf-8", errors="replace"), end="", flush=True)
+                    output_chunks.append(remaining)
+                break
+            events = selector.select(timeout=max(0.0, min(1.0, deadline - now)))
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    continue
+                print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
+                output_chunks.append(chunk)
+        if proc.poll() is None:
+            proc.wait()
+    finally:
+        selector.close()
+        proc.stdout.close()
+    dt = time.monotonic() - t0
+    out = b"".join(output_chunks).decode("utf-8", errors="replace")
+    _log(f"<<< exit={proc.returncode}  dt={dt:.2f}s")
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out.encode("utf-8"))
+    if check and proc.returncode != 0:
+        raise SystemExit(f"command failed rc={proc.returncode}: {' '.join(cmd)}")
+    return int(proc.returncode or 0), out, dt
+
+
+def _run_multirank(
+    cmd: List[str],
+    cwd: str,
+    base_env: Dict[str, str],
+    num_gpus: int,
+    nccl_id_path: str,
+    timeout: int,
+) -> Tuple[int, str, float]:
+    if num_gpus <= 0:
+        raise ValueError("num_gpus must be >= 1")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if not cmd:
+        raise ValueError("cmd must not be empty")
+
+    _log(f">>> multirank {' '.join(cmd)} ranks={num_gpus} (cwd={cwd})")
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+
+    _clear_rank_coordination_files(nccl_id_path)
+
+    rank_envs: List[Dict[str, str]] = []
+    for rank_index in range(num_gpus):
+        rank_env = base_env.copy()
+        rank_env["WORLD_SIZE"] = str(num_gpus)
+        rank_env["RANK"] = str(rank_index)
+        rank_env["LOCAL_RANK"] = str(rank_index)
+        rank_env["JAIDE_NCCL_ID_PATH"] = nccl_id_path
+        rank_envs.append(rank_env)
+
+    procs: List[subprocess.Popen[Any]] = []
+    fd_to_rank: Dict[int, int] = {}
+    output_chunks: List[bytes] = []
+    selector = selectors.DefaultSelector()
+    timed_out = False
+
+    try:
+        for rank_index in range(num_gpus):
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=rank_envs[rank_index],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                bufsize=0,
+                start_new_session=True,
+            )
+            if proc.stdout is None:
+                procs.append(proc)
+                for started in procs:
+                    _terminate_process_group(started)
+                raise RuntimeError(f"rank {rank_index} stdout pipe was not created")
+            procs.append(proc)
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            fd_to_rank[proc.stdout.fileno()] = rank_index
+
+        open_streams = num_gpus
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                for proc in procs:
+                    _terminate_process_group(proc)
+                break
+
+            if open_streams == 0 and all(proc.poll() is not None for proc in procs):
+                break
+
+            events = selector.select(timeout=max(0.05, min(1.0, deadline - now)))
+            if not events:
+                if open_streams == 0 and all(proc.poll() is not None for proc in procs):
+                    break
+                continue
+
+            for key, _ in events:
+                rank_index = fd_to_rank.get(key.fd, -1)
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    open_streams -= 1
+                    continue
+                prefix = f"[rank {rank_index}] ".encode("utf-8")
+                for line in chunk.splitlines(keepends=True):
+                    output_chunks.append(prefix + line)
+                for line in chunk.splitlines(keepends=True):
+                    sys.stdout.buffer.write(prefix + line)
+                sys.stdout.buffer.flush()
+
+        for proc in procs:
+            if proc.poll() is None:
+                proc.wait()
+    finally:
+        selector.close()
+        for proc in procs:
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+
+    dt = time.monotonic() - t0
+    combined_out = b"".join(output_chunks).decode("utf-8", errors="replace")
+    returncodes = [proc.returncode for proc in procs]
+    failures = [int(code) for code in returncodes if code not in (None, 0)]
+    combined_rc = 0 if not failures else max(failures)
+    _log(f"<<< multirank ranks={num_gpus} rcs={returncodes} dt={dt:.2f}s")
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=combined_out.encode("utf-8"))
+    return combined_rc, combined_out, dt
+
+
+def _write_report(report_dir: Path, name: str, content: str) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    fp = report_dir / name
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(content)
+    _log(f"report written: {fp}")
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    count = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _download_finephrase(target_path: Path, cap: int) -> Tuple[int, int]:
+    from datasets import load_dataset
+
+    if cap <= 0:
+        raise ValueError("sample cap must be positive")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists() and target_path.stat().st_size > 0:
+        line_count = _count_nonempty_lines(target_path)
+        size = target_path.stat().st_size
+        _log(f"dataset already present: {target_path} ({line_count} lines, {size} bytes)")
+        return size, line_count
+
+    tmp = target_path.with_suffix(".tmp.jsonl")
+    _safe_unlink(tmp)
+
+    ds = load_dataset("HuggingFaceFW/finephrase", "faq", split="train", streaming=True)
+    written = 0
+    try:
+        with open(tmp, "w", encoding="utf-8") as f_out:
+            for row in ds:
+                text = None
+                if isinstance(row, dict):
+                    for key in ("text", "content", "sentence", "article"):
+                        val = row.get(key)
+                        if isinstance(val, str) and val.strip():
+                            text = val.strip()
+                            break
+                if text and len(text) > 20:
+                    f_out.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+                    written += 1
+                    if written >= cap:
+                        break
+            f_out.flush()
+            os.fsync(f_out.fileno())
+        if written < cap:
+            raise RuntimeError(f"dataset ended after {written} usable samples, requested {cap}")
+        tmp.replace(target_path)
+    except BaseException:
+        _safe_unlink(tmp)
+        raise
+    size = target_path.stat().st_size
+    _log(f"downloaded {written} samples, {size} bytes -> {target_path}")
+    return size, written
+
+
+def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
+    accel_dir = os.path.join(project_dir, "src", "hw", "accel")
+    _log("Futhark pkg sync")
+    _run(
+        ["futhark", "pkg", "sync"],
+        cwd=accel_dir,
+        env=env,
+        check=False,
+        timeout=180,
+    )
+    _log("Futhark CPU library build")
+    _run(
+        [
+            "futhark",
+            "c",
+            "--library",
+            os.path.join(accel_dir, "futhark_kernels.fut"),
+            "-o",
+            os.path.join(accel_dir, "futhark_kernels"),
+        ],
+        cwd=project_dir,
+        env=env,
+    )
+    _log("Futhark CUDA library build")
+    _run(
+        [
+            "futhark",
+            "cuda",
+            "--library",
+            os.path.join(accel_dir, "main.fut"),
+            "-o",
+            os.path.join(accel_dir, "main_gpu"),
+        ],
+        cwd=project_dir,
+        env=env,
+    )
+
+
+def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
+    samples: Dict[int, Dict[str, List[float]]] = {}
+    for row in csv.reader(text.splitlines()):
+        if len(row) != 6:
+            continue
+        try:
+            index = int(row[0].strip())
+        except ValueError:
+            continue
+        target = samples.setdefault(index, {
+            "utilization_gpu_pct": [],
+            "memory_used_mib": [],
+            "memory_total_mib": [],
+            "power_draw_w": [],
+            "clock_sm_mhz": [],
+        })
+        for key, raw_value in zip(target, row[1:]):
+            try:
+                target[key].append(float(raw_value.strip()))
+            except ValueError:
+                pass
+    result: Dict[str, Any] = {}
+    for index, metrics in samples.items():
+        result[str(index)] = {
+            key: {
+                "count": len(values),
+                "min": min(values),
+                "max": max(values),
+                "mean": sum(values) / len(values),
+            }
+            for key, values in metrics.items()
+            if values
+        }
+    return result
+
+
+@app.function(
+    image=image,
+    cpu=(CPU_REQUEST, CPU_LIMIT),
+    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
+    timeout=CPU_TIMEOUT_SEC,
+    volumes={
+        str(DATA_MOUNT_PATH): data_volume,
+        str(REPORT_MOUNT_PATH): report_volume,
+        str(BUILD_MOUNT_PATH): build_volume,
+    },
+)
+def prepare_cpu(run_id: int) -> Dict[str, Any]:
+    project_dir = str(PROJECT_MOUNT_PATH)
+    env = os.environ.copy()
+
+    report_dir = REPORT_MOUNT_PATH / f"run_{run_id}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    result: Dict[str, Any] = {
+        "run_id": run_id,
+        "report_dir": str(report_dir),
+        "phases": {},
+    }
+
+    _log("=" * 70)
+    _log(f"CPU PREPARE PHASE run_id={run_id}")
+    _log("=" * 70)
+
+    _run(["zig", "version"], cwd=project_dir, env=env)
+    _run(["futhark", "--version"], cwd=project_dir, env=env)
+
+    _run_futhark_kernels(project_dir, env)
+
+    zig_cache = Path(project_dir) / ".zig-cache"
+    if zig_cache.exists():
+        shutil.rmtree(str(zig_cache))
+        _log("Cleared stale .zig-cache before build")
+
+    _log("=" * 70)
+    _log("PHASE B: GPU-target build (-Dgpu=true)")
+    _log("=" * 70)
+    t0 = time.time()
+    rc_b, out_b, _ = _run(
+        [
+            "zig",
+            "build",
+            "-Dgpu=false",
+            "-Doptimize=ReleaseSafe",
+            "-Dskip-futhark=true",
+        ],
+        cwd=project_dir,
+        env=env,
+        check=False,
+        timeout=1800,
+    )
+    rc_b_dist, out_b_dist, _ = _run(
+        [
+            "zig",
+            "build",
+            "distributed-futhark",
+            "-Dgpu=true",
+            "-Doptimize=ReleaseSafe",
+            "-Dskip-futhark=true",
+        ],
+        cwd=project_dir,
+        env=env,
+        check=False,
+        timeout=1800,
+    )
+    result["phases"]["B_gpu_build"] = {
+        "returncode": rc_b if rc_b != 0 else rc_b_dist,
+        "inference_build_returncode": rc_b,
+        "distributed_build_returncode": rc_b_dist,
+        "duration_s": round(time.time() - t0, 2),
+    }
+    _write_report(
+        report_dir,
+        "phase_b_gpu_build.log",
+        "\n".join(
+            (
+                "=== inference build: zig build -Dgpu=false -Doptimize=ReleaseSafe -Dskip-futhark=true ===",
+                out_b,
+                "=== distributed build: zig build distributed-futhark -Dgpu=true -Doptimize=ReleaseSafe -Dskip-futhark=true ===",
+                out_b_dist,
+            )
+        ),
+    )
+
+    inference_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-inference-server"
+    distributed_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-distributed-futhark"
+
+    build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
+    build_target_dir.mkdir(parents=True, exist_ok=True)
+
+    if distributed_bin.exists():
+        shutil.copy2(str(distributed_bin), str(build_target_dir / "jaide-distributed-futhark"))
+        os.chmod(str(build_target_dir / "jaide-distributed-futhark"), 0o755)
+        result["distributed_binary_present"] = True
+    else:
+        result["distributed_binary_present"] = False
+        _log(f"WARN: distributed binary NOT built at {distributed_bin}")
+
+    if inference_bin.exists():
+        shutil.copy2(str(inference_bin), str(build_target_dir / "jaide-inference-server"))
+        os.chmod(str(build_target_dir / "jaide-inference-server"), 0o755)
+        result["inference_binary_present"] = True
+    else:
+        result["inference_binary_present"] = False
+        _log(f"WARN: inference binary NOT built at {inference_bin}")
+
+    _log("=" * 70)
+    _log(f"PHASE C-prep: dataset download ({SAMPLE_CAP} samples)")
+    _log("=" * 70)
+    dataset_path = Path(DATASET_PATH)
+    try:
+        t0 = time.time()
+        size, sample_count = _download_finephrase(dataset_path, SAMPLE_CAP)
+        result["phases"]["C_prep_dataset"] = {
+            "duration_s": round(time.time() - t0, 2),
+            "sample_count": sample_count,
+            "dataset_bytes": size,
+            "dataset_path": str(dataset_path),
+        }
+    except Exception as exc:
+        _log(f"dataset download failed: {exc}")
+        result["phases"]["C_prep_dataset"] = {"error": str(exc)}
+
+    data_volume.commit()
+    build_volume.commit()
+    report_volume.commit()
+
+    _log("=" * 70)
+    _log("CPU PREPARE PHASE DONE")
+    _log("=" * 70)
+
+    return result
+
+
+@app.function(
+    image=image,
+    gpu=GPU_SPEC,
+    cpu=(CPU_REQUEST, CPU_LIMIT),
+    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
+    timeout=TIMEOUT_SEC,
+    volumes={
+        str(DATA_MOUNT_PATH): data_volume,
+        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
+        str(REPORT_MOUNT_PATH): report_volume,
+        str(BUILD_MOUNT_PATH): build_volume,
+    },
+)
+def run_gpu_train_and_infer(
+    run_id: int,
+    prep_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_dir = str(PROJECT_MOUNT_PATH)
+    env = os.environ.copy()
+
+    build_volume.reload()
+    data_volume.reload()
+    checkpoint_volume.reload()
+
+    report_dir = REPORT_MOUNT_PATH / f"run_{run_id}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    result: Dict[str, Any] = {
+        "run_id": run_id,
+        "gpu_spec": GPU_SPEC,
+        "model_dim": MODEL_DIM,
+        "num_layers": NUM_LAYERS,
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "sample_cap": SAMPLE_CAP,
+        "max_seq_len": MAX_SEQ_LEN,
+        "learning_rate": LEARNING_RATE,
+        "vocab_size": VOCAB_SIZE,
+        "spectral_norm_target": SPECTRAL_NORM_TARGET,
+        "spectral_power_iterations": SPECTRAL_POWER_ITERATIONS,
+        "seed_offset": SEED_OFFSET,
+        "grad_mean": GRAD_MEAN,
+        "normalized_gradient_flow": NORMALIZED_GRADIENT_FLOW,
+        "gradient_clip_norm": GRADIENT_CLIP_NORM,
+        "sfd_trust_ratio": SFD_TRUST_RATIO,
+        "sfd_weight_floor": SFD_WEIGHT_FLOOR,
+        "spectral_interval": SPECTRAL_INTERVAL,
+        "logdet_weight": LOGDET_WEIGHT,
+        "clip_min": CLIP_MIN,
+        "clip_max": CLIP_MAX,
+        "checkpoint_path": CHECKPOINT_PATH,
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "reasoning_cycles": REASONING_CYCLES,
+        "relational_pass_interval": RELATIONAL_PASS_INTERVAL,
+        "phases": {},
+    }
+
+    _log("=" * 70)
+    _log(f"GPU PHASE START gpu={GPU_SPEC} run_id={run_id}")
+    _log("=" * 70)
+    gpu_phase_start = time.time()
+
+    _run(["nvidia-smi"], cwd=project_dir, env=env, check=False, timeout=30)
+    _run(["lscpu"], cwd=project_dir, env=env, check=False, timeout=10)
+
+    build_source_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
+    distributed_bin_src = build_source_dir / "jaide-distributed-futhark"
+    inference_bin_src = build_source_dir / "jaide-inference-server"
+
+    distributed_bin = Path("/tmp/jaide-distributed-futhark")
+    inference_bin = Path("/tmp/jaide-inference-server")
+
+    if distributed_bin_src.exists():
+        shutil.copy2(str(distributed_bin_src), str(distributed_bin))
+        os.chmod(str(distributed_bin), 0o755)
+        _log(f"distributed binary staged: {distributed_bin}")
+    else:
+        _log(f"ERROR: distributed binary missing from {distributed_bin_src}")
+
+    if inference_bin_src.exists():
+        shutil.copy2(str(inference_bin_src), str(inference_bin))
+        os.chmod(str(inference_bin), 0o755)
+        _log(f"inference binary staged: {inference_bin}")
+    else:
+        _log(f"WARN: inference binary missing from {inference_bin_src}")
+
+    dataset_meta = prep_result.get("phases", {}).get("C_prep_dataset", {})
+    dataset_path = dataset_meta.get("dataset_path")
+    sample_count = int(dataset_meta.get("sample_count", 0) or 0)
+
+    training_succeeded = False
+    training_started_ns = 0
+
+    if not distributed_bin.exists():
+        result["phases"]["C_training_convergence"] = {"skipped": "distributed binary missing"}
+    elif not dataset_path or sample_count <= 0:
+        result["phases"]["C_training_convergence"] = {"skipped": "dataset not prepared"}
+    else:
+        _log("=" * 70)
+        _log(f"PHASE C: TRAINING ({sample_count} samples, {EPOCHS} epochs, dim={MODEL_DIM})")
+        _log("=" * 70)
+
+        train_env = env.copy()
+        train_env["WORLD_SIZE"] = str(NUM_GPUS)
+        train_env["MASTER_ADDR"] = MASTER_ADDR
+        train_env["MASTER_PORT"] = MASTER_PORT
+        train_env["JAIDE_EPOCHS"] = str(EPOCHS)
+        train_env["JAIDE_DATASET"] = str(dataset_path)
+        train_env["JAIDE_MODEL_DIM"] = str(MODEL_DIM)
+        train_env["JAIDE_LAYERS"] = str(NUM_LAYERS)
+        train_env["JAIDE_BATCH_SIZE"] = str(BATCH_SIZE)
+        nccl_id_path = f"/tmp/jaide_nccl_id_{run_id}"
+        train_env["JAIDE_NCCL_ID_PATH"] = nccl_id_path
+        train_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
+        train_env["JAIDE_MAX_SAMPLES"] = str(min(sample_count, SAMPLE_CAP))
+        train_env["JAIDE_MAX_SEQ_LEN"] = str(MAX_SEQ_LEN)
+        train_env["JAIDE_LEARNING_RATE"] = LEARNING_RATE
+        train_env["JAIDE_VOCAB_SIZE"] = str(VOCAB_SIZE)
+        train_env["JAIDE_TOKENIZER_VOCAB"] = CHECKPOINT_PATH
+        train_env["JAIDE_SPECTRAL_NORM_TARGET"] = SPECTRAL_NORM_TARGET
+        train_env["JAIDE_SPECTRAL_POWER_ITERATIONS"] = str(SPECTRAL_POWER_ITERATIONS)
+        train_env["JAIDE_SEED_OFFSET"] = str(SEED_OFFSET)
+        train_env["JAIDE_GRAD_MEAN"] = GRAD_MEAN
+        train_env["JAIDE_NORMALIZED_GRADIENT_FLOW"] = NORMALIZED_GRADIENT_FLOW
+        train_env["JAIDE_GRADIENT_CLIP_NORM"] = GRADIENT_CLIP_NORM
+        train_env["JAIDE_SFD_TRUST_RATIO"] = SFD_TRUST_RATIO
+        train_env["JAIDE_SFD_WEIGHT_FLOOR"] = SFD_WEIGHT_FLOOR
+        train_env["JAIDE_SPECTRAL_INTERVAL"] = str(SPECTRAL_INTERVAL)
+        train_env["JAIDE_LOGDET_WEIGHT"] = LOGDET_WEIGHT
+        train_env["JAIDE_CLIP_MIN"] = CLIP_MIN
+        train_env["JAIDE_CLIP_MAX"] = CLIP_MAX
+        train_env["JAIDE_CHECKPOINT_VERSION"] = str(CHECKPOINT_VERSION)
+        train_env["JAIDE_CHECKPOINT_INTERVAL_EPOCHS"] = str(CHECKPOINT_INTERVAL_EPOCHS)
+        if RESUME_CHECKPOINT:
+            train_env["JAIDE_RESUME_CHECKPOINT"] = RESUME_CHECKPOINT
+        train_env["JAIDE_TOKENIZER_LANGUAGE"] = "english"
+        train_env["JAIDE_REASONING_CYCLES"] = str(REASONING_CYCLES)
+        train_env["JAIDE_RELATIONAL_PASS_INTERVAL"] = str(RELATIONAL_PASS_INTERVAL)
+        train_env["JAIDE_RECONSTRUCTION_ALPHA"] = RECONSTRUCTION_ALPHA
+        train_env["JAIDE_PHASE_A_STEPS"] = str(PHASE_A_STEPS)
+        train_env["JAIDE_PHASE_B_STEPS"] = str(PHASE_B_STEPS)
+        train_env["JAIDE_SHUFFLE_TARGET_CONTROL"] = SHUFFLE_TARGET_CONTROL
+        train_env["JAIDE_TARGET_SOURCE_FROZEN"] = TARGET_SOURCE_FROZEN
+        train_env["JAIDE_SPECTRAL_DEPTH_COMPENSATION"] = SPECTRAL_DEPTH_COMPENSATION
+        vocab_file = Path(CHECKPOINT_PATH)
+        if vocab_file.is_file() and vocab_file.stat().st_size > 0:
+            train_env["JAIDE_VOCAB_READY"] = "1"
+            _log(
+                f"existing vocab found at {vocab_file} ({vocab_file.stat().st_size} bytes), skipping BPE training (JAIDE_VOCAB_READY=1)"
+            )
+        else:
+            train_env.pop("JAIDE_VOCAB_READY", None)
+            _log(f"no valid vocab at {vocab_file}, BPE training will run on rank 0")
+        train_env["NCCL_DEBUG"] = NCCL_DEBUG
+        train_env["NCCL_IB_DISABLE"] = NCCL_IB_DISABLE
+        train_env["NCCL_SOCKET_IFNAME"] = NCCL_SOCKET_IFNAME
+        train_env["NCCL_P2P_DISABLE"] = "0"
+        train_env["NCCL_SHM_DISABLE"] = "0"
+        train_env["NCCL_NVLS_ENABLE"] = "0"
+        train_env["CUDA_DEVICE_ORDER"] = CUDA_DEVICE_ORDER
+        train_env["JAIDE_RELATIONAL_FAST"] = JAIDE_RELATIONAL_FAST
+        cache_hasher = hashlib.sha256()
+        cache_hasher.update((PROJECT_MOUNT_PATH / "src/hw/accel/main.fut").read_bytes())
+        cache_hasher.update(b"futhark-0.26.4-cuda-sm100")
+        futhark_cache_path = CHECKPOINT_MOUNT_PATH / f"futhark_gpu_cache_{cache_hasher.hexdigest()[:20]}.bin"
+        train_env["JAIDE_FUTHARK_CACHE"] = str(futhark_cache_path)
+
+        _clear_rank_coordination_files(nccl_id_path)
+
+        training_command = [str(distributed_bin)]
+        if NCU_ENABLE:
+            ncu_path = shutil.which("ncu")
+            if not ncu_path:
+                raise RuntimeError("JAIDE_BENCH_NCU=1 but ncu is unavailable")
+            training_command = [
+                ncu_path,
+                "--target-processes",
+                "all",
+                "--csv",
+                "--page",
+                "raw",
+                "--launch-count",
+                "20",
+                "--metrics",
+                "sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum",
+                str(distributed_bin),
+            ]
+        monitor_path = Path("/tmp") / f"jaide_gpu_monitor_{run_id}.csv"
+        monitor_file = monitor_path.open("w", encoding="utf-8")
+        monitor_process = subprocess.Popen(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm",
+                "--format=csv,noheader,nounits",
+                "-lms",
+                "500",
+            ],
+            stdout=monitor_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        t0 = time.time()
+        training_started_ns = time.time_ns()
+        try:
+            rc_c, out_c, _ = _run_multirank(
+                cmd=training_command,
+                cwd=project_dir,
+                base_env=train_env,
+                num_gpus=NUM_GPUS,
+                nccl_id_path=nccl_id_path,
+                timeout=72000,
+            )
+        finally:
+            _terminate_process_group(monitor_process)
+            monitor_process.wait()
+            monitor_file.close()
+        phase_c_duration = time.time() - t0
+        training_succeeded = rc_c == 0
+        gpu_monitor_text = monitor_path.read_text(encoding="utf-8") if monitor_path.exists() else ""
+        gpu_monitor_metrics = _parse_gpu_monitor(gpu_monitor_text)
+        _write_report(report_dir, "phase_c_gpu_monitor.csv", gpu_monitor_text)
+
+        loss_curve: List[Tuple[int, float]] = []
+        recon_curve: List[Tuple[int, float]] = []
+        source_rms_curve: List[Tuple[int, float]] = []
+        epoch_metrics: List[Dict[str, Any]] = []
+        timing_keys = (
+            "dataset_ms",
+            "tokenizer_ms",
+            "model_compile_initialization_ms",
+            "graph_ms",
+            "startup_total_ms",
+            "spectral_ms",
+            "relational_ms",
+            "reduction_update_ms",
+            "capture_ms",
+            "write_ms",
+            "step_total_ms",
+        )
+        timing_samples: Dict[str, List[int]] = {key: [] for key in timing_keys}
+        throughput_samples: List[Tuple[int, int]] = []
+        for line in out_c.splitlines():
+            for timing_key in timing_keys:
+                marker = timing_key + "="
+                if marker in line:
+                    try:
+                        timing_samples[timing_key].append(int(line.split(marker, 1)[1].split()[0]))
+                    except (ValueError, IndexError):
+                        pass
+            if "global_tokens=" in line and "step_total_ms=" in line:
+                try:
+                    token_count = int(line.split("global_tokens=", 1)[1].split()[0])
+                    step_time_ms = int(line.split("step_total_ms=", 1)[1].split()[0])
+                    if token_count > 0 and step_time_ms > 0:
+                        throughput_samples.append((token_count, step_time_ms))
+                except (ValueError, IndexError):
+                    pass
+            if "[Step " in line and "Loss:" in line:
+                try:
+                    s_part = line.split("[Step ")[1].split("]")[0].strip()
+                    step_index = int(s_part)
+                    l_part = line.split("Loss:")[1].strip().split()[0]
+                    loss_curve.append((step_index, float(l_part)))
+                except (ValueError, IndexError):
+                    continue
+                if "Recon:" in line:
+                    try:
+                        r_part = line.split("Recon:")[1].strip().split()[0]
+                        recon_curve.append((step_index, float(r_part)))
+                    except (ValueError, IndexError):
+                        pass
+                if "SourceRMS:" in line:
+                    try:
+                        rms_part = line.split("SourceRMS:")[1].strip().split()[0]
+                        source_rms_curve.append((step_index, float(rms_part)))
+                    except (ValueError, IndexError):
+                        pass
+            if "[Epoch " in line and "Loss:" in line and "Time:" in line:
+                try:
+                    epoch_line = line.split("[Epoch ", 1)[1]
+                    after_bracket = epoch_line.split("]", 1)[1]
+                    loss_str = after_bracket.split("Loss:")[1].split("|")[0].strip()
+                    time_str = after_bracket.split("Time:")[1].strip().rstrip("s")
+                    epoch_metrics.append(
+                        {
+                            "loss": float(loss_str),
+                            "time_s": float(time_str),
+                        }
+                    )
+                except (ValueError, IndexError):
+                    pass
+
+        metrics_path = CHECKPOINT_MOUNT_PATH / "training_metrics.json"
+        training_metrics_json: Optional[Dict[str, Any]] = None
+        if metrics_path.exists():
+            try:
+                metrics_text = metrics_path.read_text(encoding="utf-8")
+                training_metrics_json = json.loads(metrics_text)
+                _write_report(report_dir, "training_metrics.json", metrics_text)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        result["phases"]["C_training_convergence"] = {
+            "returncode": rc_c,
+            "duration_s": round(phase_c_duration, 2),
+            "sample_count": sample_count,
+            "loss_curve_length": len(loss_curve),
+            "first_loss": loss_curve[0][1] if loss_curve else None,
+            "last_loss": loss_curve[-1][1] if loss_curve else None,
+            "recon_curve_length": len(recon_curve),
+            "first_recon": recon_curve[0][1] if recon_curve else None,
+            "last_recon": recon_curve[-1][1] if recon_curve else None,
+            "recon_converged": (len(recon_curve) >= 2 and recon_curve[-1][1] < recon_curve[0][1]) if recon_curve else False,
+            "first_source_rms": source_rms_curve[0][1] if source_rms_curve else None,
+            "last_source_rms": source_rms_curve[-1][1] if source_rms_curve else None,
+            "source_collapse_suspected": (
+                len(source_rms_curve) >= 2
+                and source_rms_curve[0][1] > 0.0
+                and source_rms_curve[-1][1] < source_rms_curve[0][1] * 0.5
+            ) if source_rms_curve else False,
+            "num_gpus": NUM_GPUS,
+            "reconstruction_alpha": RECONSTRUCTION_ALPHA,
+            "phase_a_steps": PHASE_A_STEPS,
+            "phase_b_steps": PHASE_B_STEPS,
+            "shuffle_target_control": SHUFFLE_TARGET_CONTROL,
+            "effective_batch_size": BATCH_SIZE * NUM_GPUS,
+            "epoch_metrics": epoch_metrics,
+            "training_metrics_json": training_metrics_json,
+            "gpu_monitor": gpu_monitor_metrics,
+            "gpu_telemetry_available": bool(gpu_monitor_metrics),
+            "gpu_memory_telemetry_available": bool(gpu_monitor_metrics) and all(
+                "memory_used_mib" in metrics and metrics["memory_used_mib"].get("count", 0) > 0
+                for metrics in gpu_monitor_metrics.values()
+            ),
+            "ncu_enabled": NCU_ENABLE,
+            "ncu_occupancy_metric_present": ("sm__warps_active.avg.pct_of_peak_sustained_active" in out_c) if NCU_ENABLE else None,
+            "sampled_tokens_per_second": (
+                sum(tokens for tokens, _ in throughput_samples) * 1000.0 /
+                sum(milliseconds for _, milliseconds in throughput_samples)
+            ) if throughput_samples else None,
+            "timing_ms": {
+                key: {
+                    "count": len(values),
+                    "min": min(values) if values else None,
+                    "max": max(values) if values else None,
+                    "mean": (sum(values) / len(values)) if values else None,
+                }
+                for key, values in timing_samples.items()
+            },
+            "converged": (len(loss_curve) >= 2 and loss_curve[-1][1] < loss_curve[0][1]) if loss_curve else False,
+        }
+        _write_report(report_dir, "phase_c_training.log", out_c)
+        _write_report(
+            report_dir,
+            "phase_c_loss_curve.jsonl",
+            "\n".join(json.dumps({"step": s, "loss": l}) for s, l in loss_curve),
+        )
+        _write_report(
+            report_dir,
+            "phase_c_recon_curve.jsonl",
+            "\n".join(json.dumps({"step": s, "recon": r}) for s, r in recon_curve),
+        )
+        _write_report(
+            report_dir,
+            "phase_c_source_rms_curve.jsonl",
+            "\n".join(json.dumps({"step": s, "source_rms": v}) for s, v in source_rms_curve),
+        )
+        checkpoint_volume.commit()
+
+    if not inference_bin.exists():
+        result["phases"]["D_inference"] = {"skipped": "inference binary missing"}
+    elif not training_succeeded:
+        result["phases"]["D_inference"] = {
+            "skipped": "training did not complete successfully; refusing to smoke-test a stale checkpoint",
+            "server_up": False,
+        }
+    else:
+        _log("=" * 70)
+        _log("PHASE D: INFERENCE SERVER SMOKE TEST")
+        _log("=" * 70)
+
+        model_candidates: List[Path] = []
+        for candidate in CHECKPOINT_MOUNT_PATH.rglob("model.ckpt"):
+            try:
+                if candidate.stat().st_mtime_ns >= training_started_ns:
+                    model_candidates.append(candidate)
+            except OSError:
+                continue
+        model_candidates.sort(key=lambda candidate: (candidate.stat().st_mtime_ns, str(candidate)), reverse=True)
+        model_path = str(model_candidates[0]) if model_candidates else None
+        _log(f"model_path candidate from this run: {model_path}")
+
+        if not model_path:
+            result["phases"]["D_inference"] = {
+                "error": "training completed but did not publish a fresh model.ckpt",
+                "server_up": False,
+            }
+        else:
+            inf_env = env.copy()
+            inf_env["JAIDE_MODEL_PATH"] = model_path
+            inf_env.setdefault("NCCL_DEBUG", "WARN")
+
+            srv_log_path = report_dir / "phase_d_server.log"
+            with open(srv_log_path, "w", encoding="utf-8") as srv_f:
+                srv_proc = subprocess.Popen(
+                    [str(inference_bin), "--port", "8080", "--host", "127.0.0.1", "--allow-anonymous"],
+                    cwd=project_dir,
+                    env=inf_env,
+                    stdout=srv_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+
+                try:
+                    server_up = False
+                    health_json = ""
+                    health: Optional[Dict[str, Any]] = None
+                    startup_attempts = max(1, INFERENCE_STARTUP_TIMEOUT_SEC * 2)
+                    for _ in range(startup_attempts):
+                        time.sleep(0.5)
+                        rc_h, out_h, _ = _run(
+                            [
+                                "curl",
+                                "-sS",
+                                "-o",
+                                "/tmp/health.json",
+                                "-w",
+                                "%{http_code}",
+                                "http://127.0.0.1:8080/v1/health",
+                            ],
+                            cwd=project_dir,
+                            env=inf_env,
+                            check=False,
+                            timeout=10,
+                        )
+                        if rc_h != 0 or out_h.strip() != "200" or not Path("/tmp/health.json").exists():
+                            continue
+                        health_json = Path("/tmp/health.json").read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        try:
+                            parsed_health = json.loads(health_json)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(parsed_health, dict):
+                            continue
+                        health = parsed_health
+                        if health.get("status") == "healthy" and health.get("model_loaded") is True:
+                            server_up = True
+                            break
+
+                    if not server_up:
+                        try:
+                            server_log = srv_log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+                        except OSError:
+                            server_log = ""
+                        result["phases"]["D_inference"] = {
+                            "error": "health endpoint never reported a loaded model",
+                            "server_up": False,
+                            "health": health_json,
+                            "server_log_tail": server_log,
+                            "model_path": model_path,
+                        }
+                    else:
+                        _log(f"health OK: {health_json}")
+
+                        prompt = "The reversible sparse flow model demonstrates"
+                        req_body = json.dumps({"text": prompt, "max_tokens": 20})
+                        inference_response_path = Path("/tmp/inference.json")
+                        _safe_unlink(inference_response_path)
+                        t0 = time.time()
+                        rc_i, out_i, _ = _run(
+                            [
+                                "curl",
+                                "-sS",
+                                "-o",
+                                str(inference_response_path),
+                                "-w",
+                                "%{http_code}",
+                                "-X",
+                                "POST",
+                                "-H",
+                                "Content-Type: application/json",
+                                "-d",
+                                req_body,
+                                "http://127.0.0.1:8080/v1/inference",
+                            ],
+                            cwd=project_dir,
+                            env=inf_env,
+                            check=False,
+                            timeout=60,
+                        )
+                        inference_duration = time.time() - t0
+                        response_body = (
+                            inference_response_path.read_text(encoding="utf-8", errors="replace")
+                            if inference_response_path.exists()
+                            else ""
+                        )
+
+                        parsed: Optional[Dict[str, Any]] = None
+                        try:
+                            parsed_candidate = json.loads(response_body)
+                            if isinstance(parsed_candidate, dict):
+                                parsed = parsed_candidate
+                        except json.JSONDecodeError:
+                            pass
+
+                        generated_tokens: List[int] = []
+                        generated_text_value = ""
+                        if isinstance(parsed, dict):
+                            raw_tokens = parsed.get("tokens")
+                            if isinstance(raw_tokens, list):
+                                generated_tokens = [t for t in raw_tokens if isinstance(t, int)]
+                            raw_text = parsed.get("text")
+                            if isinstance(raw_text, str):
+                                generated_text_value = raw_text
+
+                        distinct_tokens = len(set(generated_tokens))
+                        non_reserved = [t for t in generated_tokens if t >= 4]
+                        inference_http_status = out_i.strip()
+                        smoke_ok = rc_i == 0 and inference_http_status == "200" and parsed is not None
+
+                        result["phases"]["D_inference"] = {
+                            "returncode": rc_i,
+                            "http_status": inference_http_status,
+                            "duration_s": round(inference_duration, 2),
+                            "health": health_json,
+                            "prompt": prompt,
+                            "response_body": response_body,
+                            "response_parsed": parsed,
+                            "server_up": True,
+                            "model_path": model_path,
+                            "generated_token_count": len(generated_tokens),
+                            "generated_distinct_tokens": distinct_tokens,
+                            "generated_non_reserved_count": len(non_reserved),
+                            "generated_text_length": len(generated_text_value),
+                            "generation_produced_output": len(generated_tokens) > 0,
+                            "generation_is_degenerate": len(generated_tokens) > 1 and distinct_tokens <= 1,
+                            "smoke_passed": smoke_ok,
+                        }
+                        if not smoke_ok:
+                            result["phases"]["D_inference"]["error"] = "inference endpoint did not return a valid HTTP 200 JSON response"
+                        _write_report(report_dir, "phase_d_inference.log", response_body)
+                finally:
+                    _terminate_process_group(srv_proc)
+
+    training_phase = result.get("phases", {}).get("C_training_convergence", {})
+    inference_phase = result.get("phases", {}).get("D_inference", {})
+    result["verified_success"] = (
+        training_phase.get("returncode") == 0
+        and training_phase.get("gpu_telemetry_available") is True
+        and training_phase.get("gpu_memory_telemetry_available") is True
+        and training_phase.get("sampled_tokens_per_second") is not None
+        and inference_phase.get("smoke_passed") is True
+        and training_phase.get("ncu_occupancy_metric_present") is True
+    )
+    gpu_phase_duration = time.time() - gpu_phase_start
+    result["gpu_phase_duration_s"] = round(gpu_phase_duration, 2)
+    _log("=" * 70)
+    _log(f"GPU PHASE END duration={gpu_phase_duration:.2f}s")
+    _log("=" * 70)
+
+    summary_json = json.dumps(result, indent=2, default=str)
+    _write_report(report_dir, "gpu_phase_summary.json", summary_json)
+    report_volume.commit()
+
+    return result
+
+
+@app.local_entrypoint()
+def main() -> None:
+    if MODEL_DIM <= 0 or MODEL_DIM % 2 != 0:
+        raise ValueError("JAIDE_BENCH_MODEL_DIM must be a positive even integer")
+    if NUM_LAYERS <= 0:
+        raise ValueError("JAIDE_BENCH_LAYERS must be positive")
+    if BATCH_SIZE <= 0:
+        raise ValueError("JAIDE_BENCH_BATCH must be positive")
+    if EPOCHS <= 0:
+        raise ValueError("JAIDE_BENCH_EPOCHS must be positive")
+    if SAMPLE_CAP <= 0:
+        raise ValueError("JAIDE_BENCH_SAMPLE_CAP must be positive")
+    if MAX_SEQ_LEN <= 0:
+        raise ValueError("JAIDE_BENCH_MAX_SEQ_LEN must be positive")
+    if REASONING_CYCLES <= 0:
+        raise ValueError("JAIDE_BENCH_REASONING_CYCLES must be positive")
+    if RELATIONAL_PASS_INTERVAL <= 0:
+        raise ValueError("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL must be positive")
+    if NUM_GPUS <= 0:
+        raise ValueError("JAIDE_BENCH_NUM_GPUS must be a positive integer")
+    if NUM_GPUS != ALLOCATED_GPU_COUNT:
+        raise ValueError("JAIDE_BENCH_NUM_GPUS must match the GPU count in JAIDE_BENCH_GPU")
+    if CHECKPOINT_INTERVAL_EPOCHS < 0:
+        raise ValueError("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS must be non-negative")
+    if INFERENCE_STARTUP_TIMEOUT_SEC <= 0:
+        raise ValueError("JAIDE_INFERENCE_STARTUP_TIMEOUT must be positive")
+    try:
+        reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
+    except ValueError as exc:
+        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]") from exc
+    if not 0.0 <= reconstruction_alpha_value <= 1.0:
+        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]")
+    if PHASE_A_STEPS < 0:
+        raise ValueError("JAIDE_BENCH_PHASE_A_STEPS must be >= 0")
+    if PHASE_B_STEPS < 0:
+        raise ValueError("JAIDE_BENCH_PHASE_B_STEPS must be >= 0")
+    if SHUFFLE_TARGET_CONTROL not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL must be 0, 1, true or false")
+    if TARGET_SOURCE_FROZEN not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_TARGET_SOURCE_FROZEN must be 0, 1, true or false")
+    if SPECTRAL_DEPTH_COMPENSATION not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION must be 0, 1, true or false")
+    if GRAD_MEAN not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_GRAD_MEAN must be 0, 1, true or false")
+    if NORMALIZED_GRADIENT_FLOW not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW must be 0, 1, true or false")
+    if SPECTRAL_INTERVAL <= 0:
+        raise ValueError("JAIDE_BENCH_SPECTRAL_INTERVAL must be positive")
+    for name, raw_value, lower, upper in (
+        ("JAIDE_BENCH_GRADIENT_CLIP_NORM", GRADIENT_CLIP_NORM, 0.0, None),
+        ("JAIDE_BENCH_SFD_TRUST_RATIO", SFD_TRUST_RATIO, 0.0, 1.0),
+        ("JAIDE_BENCH_SFD_WEIGHT_FLOOR", SFD_WEIGHT_FLOOR, 0.0, None),
+    ):
+        value = float(raw_value)
+        if not math.isfinite(value) or value <= lower or (upper is not None and value > upper):
+            raise ValueError(f"{name} is outside its valid range")
+    logdet_weight_value = float(LOGDET_WEIGHT)
+    if not math.isfinite(logdet_weight_value):
+        raise ValueError("JAIDE_BENCH_LOGDET_WEIGHT must be finite")
+    learning_rate_value = float(LEARNING_RATE)
+    if not math.isfinite(learning_rate_value) or learning_rate_value <= 0.0:
+        raise ValueError("JAIDE_BENCH_LR must be finite and positive")
+    run_id = int(time.time())
+    _log(f"launching run_id={run_id}")
+
+    _log("STEP 1: prepare_cpu")
+    prep_result = prepare_cpu.remote(run_id)
+    print("\n" + "=" * 70)
+    print("CPU PREPARE RESULT")
+    print("=" * 70)
+    print(json.dumps(prep_result, indent=2, default=str))
+
+    if not prep_result.get("distributed_binary_present"):
+        print("\n" + "=" * 70)
+        print("ABORT: distributed binary was not built")
+        print("=" * 70)
+        raise RuntimeError("distributed binary was not built")
+
+    dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
+    if not dataset_ok:
+        print("\n" + "=" * 70)
+        print("ABORT: dataset not prepared")
+        print("=" * 70)
+        raise RuntimeError("dataset was not prepared")
+
+    _log("STEP 2: run_gpu_train_and_infer")
+    gpu_result = run_gpu_train_and_infer.remote(run_id, prep_result)
+    print("\n" + "=" * 70)
+    print("GPU PHASE RESULT")
+    print("=" * 70)
+    print(json.dumps(gpu_result, indent=2, default=str))
+    if gpu_result.get("verified_success") is not True:
+        raise RuntimeError("GPU training, telemetry, checkpoint, or inference verification failed")
+
+    final = {
+        "run_id": run_id,
+        "cpu_phase": prep_result,
+        "gpu_phase": gpu_result,
+    }
+    print("\n" + "=" * 70)
+    print("FINAL RESULT")
+    print("=" * 70)
+    print(json.dumps(final, indent=2, default=str))
