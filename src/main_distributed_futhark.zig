@@ -1531,71 +1531,18 @@ pub fn main() !void {
     var graph_stage_error: ?anyerror = null;
 
     graph_construction: {
-        if (resumed_from_checkpoint) break :graph_construction;
+        // Offline import of the full corpus (500k hashes → 1.5M edges into a
+        // CPU HashMap, plus a second JSONL scan) is not O(d) and blocked the
+        // first epoch for an hour. The relational pass already runs online on
+        // the current batch (`runCoreRelationalPass`).
         if (coordinator.isRoot()) {
             std.debug.print(
-                "[Rank {d}] Knowledge graph construction: encoding {d} samples (GPU)...\n",
+                "[Rank {d}] Skipping offline knowledge-graph import of {d} samples; relational pass is online per batch\n",
                 .{ rank, samples.len },
             );
         }
-
-        const sample_hashes = loadDatasetHashes(allocator, dataset_path, 16 * 1024 * 1024) catch |err| {
-            graph_stage_error = err;
-            break :graph_construction;
-        };
-        defer allocator.free(sample_hashes);
-
-        if (sample_hashes.len > 0) {
-            const graph_ctx = &trainer.accelerator.ctx;
-
-            var gpu_result = accel_interface.batchEncodeGraph(
-                graph_ctx,
-                sample_hashes,
-                0,
-                allocator,
-            ) catch |err| {
-                std.debug.print(
-                    "[Rank {d}] graph-construction: batchEncodeGraph failed: {} (n={d} hashes)\n",
-                    .{ rank, err, sample_hashes.len },
-                );
-                graph_stage_error = err;
-                break :graph_construction;
-            };
-            defer gpu_result.deinit();
-
-            trainer.nsir_graph.bulkImportFromGPU(
-                gpu_result.hashes,
-                gpu_result.re_a,
-                gpu_result.im_a,
-                gpu_result.re_b,
-                gpu_result.im_b,
-                gpu_result.edge_srcs,
-                gpu_result.edge_tgts,
-            ) catch |err| {
-                std.debug.print(
-                    "[Rank {d}] graph-construction: bulkImportFromGPU failed: {} (nodes={d} edges={d})\n",
-                    .{ rank, err, gpu_result.hashes.len, gpu_result.edge_srcs.len },
-                );
-                graph_stage_error = err;
-                break :graph_construction;
-            };
-
-            if (coordinator.isRoot()) {
-                std.debug.print(
-                    "[Rank {d}] Knowledge graph: {d} nodes encoded via GPU\n",
-                    .{ rank, gpu_result.hashes.len },
-                );
-            }
-        }
-
-        trainer.r_gpu.distributeGraphFast(trainer.nsir_graph) catch |err| {
-            std.debug.print(
-                "[Rank {d}] graph-construction: distributeGraphFast failed: {}\n",
-                .{ rank, err },
-            );
-            graph_stage_error = err;
-            break :graph_construction;
-        };
+        _ = resumed_from_checkpoint;
+        break :graph_construction;
     }
 
     synchronizeStageStatus(
@@ -1616,17 +1563,10 @@ pub fn main() !void {
     };
 
     const graph_elapsed = std.time.nanoTimestamp() - graph_started;
-    if (resumed_from_checkpoint) {
-        std.debug.print(
-            "[Rank {d}] Knowledge graph restored from checkpoint graph_ms={d}\n",
-            .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
-        );
-    } else {
-        std.debug.print(
-            "[Rank {d}] Knowledge graph populated and distributed graph_ms={d}\n",
-            .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
-        );
-    }
+    std.debug.print(
+        "[Rank {d}] Knowledge graph stage skipped (online per-batch) graph_ms={d}\n",
+        .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
+    );
     const startup_elapsed = std.time.nanoTimestamp() - startup_started;
     std.debug.print("[Rank {d}] startup_total_ms={d}\n", .{ rank, @divTrunc(startup_elapsed, std.time.ns_per_ms) });
 
