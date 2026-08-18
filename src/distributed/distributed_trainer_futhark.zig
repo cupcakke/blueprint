@@ -21,6 +21,7 @@ const PatternLocation = core_relational.PatternLocation;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
 const gpu_memory = @import("../hw/accel/gpu_memory.zig");
+const active_compaction = @import("active_compaction.zig");
 const cuda = @import("../hw/accel/cuda_bindings.zig");
 
 const _use_futhark_2d = FutharkArray2DF16;
@@ -181,6 +182,7 @@ pub const TrainerConfig = struct {
     target_source_frozen: bool = true,
     spectral_depth_compensation: bool = true,
     stack_only_accelerator: bool = true,
+    active_row_compaction: bool = true,
     logdet_weight: f32 = fused_logdet_weight_default,
     fisher_gamma: f32 = sfd_fisher_gamma_default,
     fisher_epsilon: f32 = sfd_fisher_epsilon_default,
@@ -1475,8 +1477,10 @@ pub const DistributedTrainerFuthark = struct {
         sequence_length: usize,
         local_active_samples: u64,
         local_token_count: u64,
+        compaction: ?active_compaction.CompactionPlan,
 
         fn deinit(self: *PreparedBatch) void {
+            if (self.compaction) |*plan| plan.deinit();
             self.allocator.free(self.flat_target_tokens);
             self.allocator.free(self.flat_input_tokens);
             self.allocator.free(self.real_sequence_lengths);
@@ -1577,6 +1581,28 @@ pub const DistributedTrainerFuthark = struct {
             self.shuffle_mutex.unlock();
         }
 
+        var compaction: ?active_compaction.CompactionPlan = null;
+        errdefer if (compaction) |*plan| plan.deinit();
+        if (self.config.active_row_compaction) {
+            compaction = active_compaction.buildPlan(
+                self.allocator,
+                flat_input_tokens,
+                flat_target_tokens,
+                real_sequence_lengths,
+                sequence_length,
+            ) catch |err| switch (err) {
+                active_compaction.CompactionError.AllocationFailed => return TrainerError.AllocationFailed,
+                active_compaction.CompactionError.SizeOverflow => return TrainerError.ValueOverflow,
+                active_compaction.CompactionError.LengthOutOfRange => return TrainerError.IndexOutOfBounds,
+                active_compaction.CompactionError.BufferTooSmall => return TrainerError.InvalidWeightsShape,
+                active_compaction.CompactionError.InvalidDimensions => return TrainerError.InvalidWeightsShape,
+            };
+            if (compaction.?.active_count == 0) {
+                compaction.?.deinit();
+                compaction = null;
+            }
+        }
+
         return PreparedBatch{
             .allocator = self.allocator,
             .token_lists = token_lists,
@@ -1588,6 +1614,7 @@ pub const DistributedTrainerFuthark = struct {
             .sequence_length = sequence_length,
             .local_active_samples = local_active_samples,
             .local_token_count = local_token_count,
+            .compaction = compaction,
         };
     }
 
@@ -1675,19 +1702,27 @@ pub const DistributedTrainerFuthark = struct {
             targets: FutharkArray3DF16,
         };
 
+        const compaction_plan: ?*const active_compaction.CompactionPlan = if (prepared.compaction) |*plan| plan else null;
+        const forward_input_tokens: []const u32 = if (compaction_plan) |plan| plan.input_tokens else prepared.flat_input_tokens;
+        const forward_target_tokens: []const u32 = if (compaction_plan) |plan| plan.target_tokens else prepared.flat_target_tokens;
+        const forward_lengths: []const usize = if (compaction_plan) |plan| plan.compactLengths() else prepared.real_sequence_lengths;
+        const forward_sequence_length: usize = if (compaction_plan) |plan| plan.compactSequenceLength() else prepared.sequence_length;
+        const forward_batch_rows: usize = if (compaction_plan) |plan| plan.active_count else try std.math.mul(usize, prepared.effective_batch_size, prepared.sequence_length);
+        const forward_batch_dim0: usize = if (compaction_plan != null) 1 else prepared.effective_batch_size;
+
         var tensors = if (self.gpu_embedding) |*embedding| embedding_block: {
             const context = &self.accelerator.ctx;
             context.mutex.lock();
             defer context.mutex.unlock();
-            var inputs = try embedding.forwardPadded(prepared.flat_input_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
+            var inputs = try embedding.forwardPadded(forward_input_tokens, forward_lengths, forward_sequence_length);
             errdefer inputs.free(context);
             const targets = if (self.target_source) |*frozen_source|
-                try frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length)
+                try frozen_source.forwardPadded(forward_target_tokens, forward_lengths, forward_sequence_length)
             else
-                try embedding.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
+                try embedding.forwardPadded(forward_target_tokens, forward_lengths, forward_sequence_length);
             break :embedding_block BatchTensors{ .inputs = inputs, .targets = targets };
         } else one_hot_block: {
-            const batch_rows = try std.math.mul(usize, prepared.effective_batch_size, prepared.sequence_length);
+            const batch_rows = forward_batch_rows;
             const data_elements = try std.math.mul(usize, batch_rows, self.model_dim);
             const data_size = try std.math.mul(usize, data_elements, @sizeOf(f16));
             var pinned_input = try PinnedMemory.alloc(data_size);
@@ -1700,6 +1735,7 @@ pub const DistributedTrainerFuthark = struct {
             @memset(input_data, @as(f16, 0.0));
             @memset(target_data, @as(f16, 0.0));
 
+            var destination_row: usize = 0;
             for (prepared.active_lists.items, 0..) |token_list, batch_index| {
                 const prediction_length = prepared.real_sequence_lengths[batch_index];
                 var sequence_index: usize = 0;
@@ -1709,10 +1745,12 @@ pub const DistributedTrainerFuthark = struct {
                         try std.math.mul(usize, batch_index, prepared.sequence_length),
                         sequence_index,
                     );
+                    const write_row = if (compaction_plan != null) destination_row else row_index;
+                    destination_row += 1;
                     const input_token: usize = @intCast(token_list.items[sequence_index]);
                     const target_token: usize = @intCast(prepared.flat_target_tokens[row_index]);
                     if (input_token >= self.model_dim or target_token >= self.model_dim) return TrainerError.TokenIndexOutOfRange;
-                    const base_index = try std.math.mul(usize, row_index, self.model_dim);
+                    const base_index = try std.math.mul(usize, write_row, self.model_dim);
                     const input_index = try std.math.add(usize, base_index, input_token);
                     const target_index = try std.math.add(usize, base_index, target_token);
                     if (input_index >= input_data.len or target_index >= target_data.len) return TrainerError.IndexOutOfBounds;
@@ -1720,20 +1758,23 @@ pub const DistributedTrainerFuthark = struct {
                     target_data[target_index] = 1.0;
                 }
             }
+            if (compaction_plan) |plan| {
+                if (destination_row != plan.active_count) return TrainerError.InvalidWeightsShape;
+            }
 
             var inputs = try FutharkArray3DF16.newFromFlat(
                 &self.accelerator.ctx,
                 input_data,
-                prepared.effective_batch_size,
-                prepared.sequence_length,
+                forward_batch_dim0,
+                forward_sequence_length,
                 self.model_dim,
             );
             errdefer inputs.free(&self.accelerator.ctx);
             const targets = try FutharkArray3DF16.newFromFlat(
                 &self.accelerator.ctx,
                 target_data,
-                prepared.effective_batch_size,
-                prepared.sequence_length,
+                forward_batch_dim0,
+                forward_sequence_length,
                 self.model_dim,
             );
             break :one_hot_block BatchTensors{ .inputs = inputs, .targets = targets };
@@ -1751,9 +1792,21 @@ pub const DistributedTrainerFuthark = struct {
         const report_progress = self.coordinator.isRoot() and (completed_step <= 50 or completed_step % 10 == 0);
         const step_t0_ns = std.time.nanoTimestamp();
         if (report_progress) {
+            const padded_rows = try std.math.mul(usize, prepared.effective_batch_size, prepared.sequence_length);
             std.debug.print(
-                "[Rank 0] Step {d} start batch={d} seq={d} dim={d} layers={d} tokens={d}\n",
-                .{ completed_step, prepared.active_lists.items.len, prepared.sequence_length, self.model_dim, self.num_layers, prepared.local_token_count },
+                "[Rank 0] Step {d} start batch={d} seq={d} dim={d} layers={d} tokens={d} rows_padded={d} rows_active={d} rows_skipped={d} compaction={s}\n",
+                .{
+                    completed_step,
+                    prepared.active_lists.items.len,
+                    prepared.sequence_length,
+                    self.model_dim,
+                    self.num_layers,
+                    prepared.local_token_count,
+                    padded_rows,
+                    forward_batch_rows,
+                    padded_rows - forward_batch_rows,
+                    if (compaction_plan != null) "on" else "off",
+                },
             );
         }
 
@@ -1790,7 +1843,7 @@ pub const DistributedTrainerFuthark = struct {
         var fused_result = try self.accelerator.fusedTrainingStep(
             &tensors.inputs,
             &tensors.targets,
-            prepared.real_sequence_lengths,
+            forward_lengths,
             self.config.grad_mean,
             if (self.config.grad_mean) local_fraction else 1.0,
             clamped_reconstruction_alpha,
@@ -1815,8 +1868,8 @@ pub const DistributedTrainerFuthark = struct {
         if (report_progress) std.debug.print("[Rank 0] Step {d} RSF/OFTB reversible backward gradients computed dt={d}ms\n", .{ completed_step, @divTrunc(step_backward_ns, 1_000_000) });
 
         try self.accumulateEmbeddingGradientsFromDelta(
-            prepared.flat_input_tokens,
-            prepared.real_sequence_lengths,
+            forward_input_tokens,
+            forward_lengths,
             &fused_result.input_delta,
         );
 
@@ -1858,7 +1911,7 @@ pub const DistributedTrainerFuthark = struct {
             .momentum_beta = self.momentum,
             .fisher_gamma = self.config.fisher_gamma,
             .fisher_epsilon = self.config.fisher_epsilon,
-            .apply_embedding_update = self.gpu_embedding != null and prepared.flat_input_tokens.len > 0,
+            .apply_embedding_update = self.gpu_embedding != null and forward_input_tokens.len > 0,
             .apply_spectral = apply_spectral,
             .local_step_increment = local_step_increment,
             .fused = fused_result,
