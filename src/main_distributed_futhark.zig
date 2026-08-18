@@ -1612,13 +1612,17 @@ pub fn main() !void {
     };
 
     const graph_elapsed = std.time.nanoTimestamp() - graph_started;
-    std.debug.print(
-        if (resumed_from_checkpoint)
-            "[Rank {d}] Knowledge graph restored from checkpoint graph_ms={d}\n"
-        else
+    if (resumed_from_checkpoint) {
+        std.debug.print(
+            "[Rank {d}] Knowledge graph restored from checkpoint graph_ms={d}\n",
+            .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
+        );
+    } else {
+        std.debug.print(
             "[Rank {d}] Knowledge graph populated and distributed graph_ms={d}\n",
-        .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
-    );
+            .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
+        );
+    }
     const startup_elapsed = std.time.nanoTimestamp() - startup_started;
     std.debug.print("[Rank {d}] startup_total_ms={d}\n", .{ rank, @divTrunc(startup_elapsed, std.time.ns_per_ms) });
 

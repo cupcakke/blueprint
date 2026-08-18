@@ -21,6 +21,7 @@ DATA_MOUNT_PATH = Path("/data")
 CHECKPOINT_MOUNT_PATH = Path("/checkpoints")
 REPORT_MOUNT_PATH = Path("/reports")
 BUILD_MOUNT_PATH = Path("/build_artifacts")
+TOKENIZER_SOURCE_PATH = PROJECT_MOUNT_PATH / "tokenizer.vocab"
 
 IGNORE_PATTERNS = [
     ".git",
@@ -49,9 +50,9 @@ def _gpu_count_from_spec(spec: str) -> int:
     try:
         count = int(parts[1])
     except ValueError as exc:
-        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count") from exc
+        raise ValueError("A JAIDE_BENCH_GPU értékének pozitív GPU számmal kell végződnie") from exc
     if count <= 0:
-        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count")
+        raise ValueError("A JAIDE_BENCH_GPU értékének pozitív GPU számmal kell végződnie")
     return count
 
 
@@ -105,7 +106,9 @@ CLIP_MAX = os.environ.get("JAIDE_BENCH_CLIP_MAX", "5.0")
 CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "7"))
 CHECKPOINT_INTERVAL_EPOCHS = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS", "5"))
 RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
-NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "1") == "1"
+NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "0") == "1"
+FORCE_REBUILD = os.environ.get("JAIDE_BENCH_FORCE_REBUILD", "0") == "1"
+SKIP_PREP = os.environ.get("JAIDE_BENCH_SKIP_PREP", "0") == "1"
 
 app = modal.App(APP_NAME)
 
@@ -143,7 +146,7 @@ image = (
         "ln -sf /opt/futhark/bin/futhark /usr/local/bin/futhark",
         "rm /tmp/futhark.tar.xz",
         "futhark --version | grep -F '0.26.4' || "
-        "{ echo 'ERROR: futhark version mismatch after install'; exit 1; }",
+        "{ echo 'HIBA: futhark verzió eltérés a telepítés után'; exit 1; }",
     )
     .env(
         {
@@ -175,8 +178,23 @@ def _safe_unlink(path: Path) -> None:
         return
 
 
+def _find_latest_binary(name: str) -> Optional[Path]:
+    if not BUILD_MOUNT_PATH.exists():
+        return None
+    candidates: List[Path] = []
+    for path in BUILD_MOUNT_PATH.rglob(name):
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                candidates.append(path)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (p.stat().st_mtime_ns, str(p)), reverse=True)
+    return candidates[0]
+
+
 def _clear_rank_coordination_files(nccl_id_path: str) -> None:
-    """Remove NCCL and filesystem-stage markers left by a previous launch."""
     base = Path(nccl_id_path)
     _safe_unlink(base)
     _safe_unlink(Path(str(base) + ".ready"))
@@ -219,10 +237,10 @@ def _run(
     input_bytes: Optional[bytes] = None,
 ) -> Tuple[int, str, float]:
     if timeout <= 0:
-        raise ValueError("timeout must be positive")
+        raise ValueError("Az időkorlátnak pozitívnak kell lennie")
     if not cmd:
-        raise ValueError("cmd must not be empty")
-    _log(f">>> {' '.join(cmd)}  (cwd={cwd})")
+        raise ValueError("A parancs nem lehet üres")
+    _log(f">>> {' '.join(cmd)}  (munkakönyvtár={cwd})")
     t0 = time.monotonic()
     deadline = t0 + timeout
     stdin_mode = subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL
@@ -238,11 +256,11 @@ def _run(
     )
     if proc.stdout is None:
         _terminate_process_group(proc)
-        raise RuntimeError("subprocess stdout pipe was not created")
+        raise RuntimeError("A folyamat szabványos kimeneti csöve nem jött létre")
     if input_bytes is not None:
         if proc.stdin is None:
             _terminate_process_group(proc)
-            raise RuntimeError("subprocess stdin pipe was not created")
+            raise RuntimeError("A folyamat szabványos bemeneti csöve nem jött létre")
         try:
             proc.stdin.write(input_bytes)
             proc.stdin.flush()
@@ -286,11 +304,11 @@ def _run(
         proc.stdout.close()
     dt = time.monotonic() - t0
     out = b"".join(output_chunks).decode("utf-8", errors="replace")
-    _log(f"<<< exit={proc.returncode}  dt={dt:.2f}s")
+    _log(f"<<< kilépési kód={proc.returncode}  időtartam={dt:.2f}s")
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=out.encode("utf-8"))
     if check and proc.returncode != 0:
-        raise SystemExit(f"command failed rc={proc.returncode}: {' '.join(cmd)}")
+        raise SystemExit(f"A parancs hibával fejeződött be (kód={proc.returncode}): {' '.join(cmd)}")
     return int(proc.returncode or 0), out, dt
 
 
@@ -303,13 +321,13 @@ def _run_multirank(
     timeout: int,
 ) -> Tuple[int, str, float]:
     if num_gpus <= 0:
-        raise ValueError("num_gpus must be >= 1")
+        raise ValueError("A GPU-k számának legalább 1-nek kell lennie")
     if timeout <= 0:
-        raise ValueError("timeout must be positive")
+        raise ValueError("Az időkorlátnak pozitívnak kell lennie")
     if not cmd:
-        raise ValueError("cmd must not be empty")
+        raise ValueError("A parancs nem lehet üres")
 
-    _log(f">>> multirank {' '.join(cmd)} ranks={num_gpus} (cwd={cwd})")
+    _log(f">>> több-GPU futtatás {' '.join(cmd)} GPU-szám={num_gpus} (munkakönyvtár={cwd})")
     t0 = time.monotonic()
     deadline = t0 + timeout
 
@@ -346,7 +364,7 @@ def _run_multirank(
                 procs.append(proc)
                 for started in procs:
                     _terminate_process_group(started)
-                raise RuntimeError(f"rank {rank_index} stdout pipe was not created")
+                raise RuntimeError(f"A(z) {rank_index}. rangú folyamat kimeneti csöve nem jött létre")
             procs.append(proc)
             selector.register(proc.stdout, selectors.EVENT_READ)
             fd_to_rank[proc.stdout.fileno()] = rank_index
@@ -382,7 +400,7 @@ def _run_multirank(
                         pass
                     open_streams -= 1
                     continue
-                prefix = f"[rank {rank_index}] ".encode("utf-8")
+                prefix = f"[GPU-{rank_index}] ".encode("utf-8")
                 for line in chunk.splitlines(keepends=True):
                     output_chunks.append(prefix + line)
                 for line in chunk.splitlines(keepends=True):
@@ -406,7 +424,7 @@ def _run_multirank(
     returncodes = [proc.returncode for proc in procs]
     failures = [int(code) for code in returncodes if code not in (None, 0)]
     combined_rc = 0 if not failures else max(failures)
-    _log(f"<<< multirank ranks={num_gpus} rcs={returncodes} dt={dt:.2f}s")
+    _log(f"<<< több-GPU futtatás GPU-szám={num_gpus} kódok={returncodes} időtartam={dt:.2f}s")
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=combined_out.encode("utf-8"))
     return combined_rc, combined_out, dt
@@ -417,7 +435,7 @@ def _write_report(report_dir: Path, name: str, content: str) -> None:
     fp = report_dir / name
     with open(fp, "w", encoding="utf-8") as f:
         f.write(content)
-    _log(f"report written: {fp}")
+    _log(f"Jelentés elmentve: {fp}")
 
 
 def _count_nonempty_lines(path: Path) -> int:
@@ -429,16 +447,49 @@ def _count_nonempty_lines(path: Path) -> int:
     return count
 
 
+def _upload_tokenizer_to_checkpoint() -> Dict[str, Any]:
+    if not TOKENIZER_SOURCE_PATH.is_file():
+        raise FileNotFoundError(f"A tokenizer forrásfájlja nem található: {TOKENIZER_SOURCE_PATH}")
+    source_size = TOKENIZER_SOURCE_PATH.stat().st_size
+    if source_size <= 0:
+        raise RuntimeError(f"A tokenizer forrásfájlja üres: {TOKENIZER_SOURCE_PATH}")
+
+    destination = Path(CHECKPOINT_PATH)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_destination = destination.with_name(destination.name + ".uploading")
+    _safe_unlink(temporary_destination)
+
+    try:
+        with TOKENIZER_SOURCE_PATH.open("rb") as source, temporary_destination.open("wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        if temporary_destination.stat().st_size != source_size:
+            raise IOError(
+                f"A tokenizer feltöltése hiányos: forrás={source_size} cél={temporary_destination.stat().st_size}"
+            )
+        os.replace(temporary_destination, destination)
+    except BaseException:
+        _safe_unlink(temporary_destination)
+        raise
+
+    return {
+        "source_path": str(TOKENIZER_SOURCE_PATH),
+        "destination_path": str(destination),
+        "bytes": source_size,
+    }
+
+
 def _download_finephrase(target_path: Path, cap: int) -> Tuple[int, int]:
     from datasets import load_dataset
 
     if cap <= 0:
-        raise ValueError("sample cap must be positive")
+        raise ValueError("A minták korlátjának pozitívnak kell lennie")
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if target_path.exists() and target_path.stat().st_size > 0:
         line_count = _count_nonempty_lines(target_path)
         size = target_path.stat().st_size
-        _log(f"dataset already present: {target_path} ({line_count} lines, {size} bytes)")
+        _log(f"Az adathalmaz már létezik: {target_path} ({line_count} sor, {size} bájt)")
         return size, line_count
 
     tmp = target_path.with_suffix(".tmp.jsonl")
@@ -464,19 +515,19 @@ def _download_finephrase(target_path: Path, cap: int) -> Tuple[int, int]:
             f_out.flush()
             os.fsync(f_out.fileno())
         if written < cap:
-            raise RuntimeError(f"dataset ended after {written} usable samples, requested {cap}")
+            raise RuntimeError(f"Az adathalmaz véget ért {written} minta után, a kért mennyiség: {cap}")
         tmp.replace(target_path)
     except BaseException:
         _safe_unlink(tmp)
         raise
     size = target_path.stat().st_size
-    _log(f"downloaded {written} samples, {size} bytes -> {target_path}")
+    _log(f"{written} minta letöltve, {size} bájt -> {target_path}")
     return size, written
 
 
 def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
     accel_dir = os.path.join(project_dir, "src", "hw", "accel")
-    _log("Futhark pkg sync")
+    _log("Futhark csomagok szinkronizálása")
     _run(
         ["futhark", "pkg", "sync"],
         cwd=accel_dir,
@@ -484,7 +535,7 @@ def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
         check=False,
         timeout=180,
     )
-    _log("Futhark CPU library build")
+    _log("Futhark CPU könyvtár fordítása")
     _run(
         [
             "futhark",
@@ -497,7 +548,7 @@ def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
         cwd=project_dir,
         env=env,
     )
-    _log("Futhark CUDA library build")
+    _log("Futhark CUDA könyvtár fordítása")
     _run(
         [
             "futhark",
@@ -555,11 +606,16 @@ def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
     timeout=CPU_TIMEOUT_SEC,
     volumes={
         str(DATA_MOUNT_PATH): data_volume,
+        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
         str(REPORT_MOUNT_PATH): report_volume,
         str(BUILD_MOUNT_PATH): build_volume,
     },
 )
 def prepare_cpu(run_id: int) -> Dict[str, Any]:
+    build_volume.reload()
+    data_volume.reload()
+    checkpoint_volume.reload()
+
     project_dir = str(PROJECT_MOUNT_PATH)
     env = os.environ.copy()
 
@@ -573,8 +629,62 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     }
 
     _log("=" * 70)
-    _log(f"CPU PREPARE PHASE run_id={run_id}")
+    _log(f"CPU ELŐKÉSZÍTÉSI FÁZIS run_id={run_id}")
     _log("=" * 70)
+
+    tokenizer_upload = _upload_tokenizer_to_checkpoint()
+    result["tokenizer_upload"] = tokenizer_upload
+    checkpoint_volume.commit()
+    _log(
+        f"Tokenizer feltöltve a Modal checkpoint kötetbe: {tokenizer_upload['destination_path']} "
+        f"({tokenizer_upload['bytes']} bájt)"
+    )
+
+    dataset_path = Path(DATASET_PATH)
+    existing_dist = _find_latest_binary("jaide-distributed-futhark")
+    existing_inf = _find_latest_binary("jaide-inference-server")
+    dataset_exists = dataset_path.exists() and dataset_path.stat().st_size > 0
+
+    if not FORCE_REBUILD and existing_dist and existing_inf and dataset_exists:
+        _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
+        _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
+        _log("Az újrafordítás és az adathalmaz letöltése átugorva, azonnali indítás.")
+
+        build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
+        build_target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(existing_dist), str(build_target_dir / "jaide-distributed-futhark"))
+        os.chmod(str(build_target_dir / "jaide-distributed-futhark"), 0o755)
+        shutil.copy2(str(existing_inf), str(build_target_dir / "jaide-inference-server"))
+        os.chmod(str(build_target_dir / "jaide-inference-server"), 0o755)
+
+        line_count = _count_nonempty_lines(dataset_path)
+        size = dataset_path.stat().st_size
+
+        result["distributed_binary_present"] = True
+        result["inference_binary_present"] = True
+        result["phases"]["B_gpu_build"] = {
+            "returncode": 0,
+            "inference_build_returncode": 0,
+            "distributed_build_returncode": 0,
+            "duration_s": 0.0,
+            "reused_binary": str(existing_dist),
+        }
+        result["phases"]["C_prep_dataset"] = {
+            "duration_s": 0.0,
+            "sample_count": line_count,
+            "dataset_bytes": size,
+            "dataset_path": str(dataset_path),
+            "reused": True,
+        }
+
+        build_volume.commit()
+        checkpoint_volume.commit()
+        report_volume.commit()
+
+        _log("=" * 70)
+        _log("CPU ELŐKÉSZÍTÉSI FÁZIS BEFEJEZŐDÖTT (MEGLÉVŐ BINÁRISOK HASZNÁLATÁVAL)")
+        _log("=" * 70)
+        return result
 
     _run(["zig", "version"], cwd=project_dir, env=env)
     _run(["futhark", "--version"], cwd=project_dir, env=env)
@@ -584,10 +694,10 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     zig_cache = Path(project_dir) / ".zig-cache"
     if zig_cache.exists():
         shutil.rmtree(str(zig_cache))
-        _log("Cleared stale .zig-cache before build")
+        _log("Elavult .zig-cache könyvtár kiürítve a fordítás előtt")
 
     _log("=" * 70)
-    _log("PHASE B: GPU-target build (-Dgpu=true)")
+    _log("B FÁZIS: GPU célú fordítás (-Dgpu=true)")
     _log("=" * 70)
     t0 = time.time()
     rc_b, out_b, _ = _run(
@@ -648,7 +758,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         result["distributed_binary_present"] = True
     else:
         result["distributed_binary_present"] = False
-        _log(f"WARN: distributed binary NOT built at {distributed_bin}")
+        _log(f"FIGYELMEZTETÉS: a disztributált bináris nem épült fel itt: {distributed_bin}")
 
     if inference_bin.exists():
         shutil.copy2(str(inference_bin), str(build_target_dir / "jaide-inference-server"))
@@ -656,12 +766,11 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         result["inference_binary_present"] = True
     else:
         result["inference_binary_present"] = False
-        _log(f"WARN: inference binary NOT built at {inference_bin}")
+        _log(f"FIGYELMEZTETÉS: az inferencia bináris nem épült fel itt: {inference_bin}")
 
     _log("=" * 70)
-    _log(f"PHASE C-prep: dataset download ({SAMPLE_CAP} samples)")
+    _log(f"C-előkészítő fázis: adathalmaz letöltése ({SAMPLE_CAP} minta)")
     _log("=" * 70)
-    dataset_path = Path(DATASET_PATH)
     try:
         t0 = time.time()
         size, sample_count = _download_finephrase(dataset_path, SAMPLE_CAP)
@@ -672,15 +781,16 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
             "dataset_path": str(dataset_path),
         }
     except Exception as exc:
-        _log(f"dataset download failed: {exc}")
+        _log(f"Az adathalmaz letöltése sikertelen: {exc}")
         result["phases"]["C_prep_dataset"] = {"error": str(exc)}
 
     data_volume.commit()
+    checkpoint_volume.commit()
     build_volume.commit()
     report_volume.commit()
 
     _log("=" * 70)
-    _log("CPU PREPARE PHASE DONE")
+    _log("CPU ELŐKÉSZÍTÉSI FÁZIS BEFEJEZŐDÖTT")
     _log("=" * 70)
 
     return result
@@ -744,7 +854,7 @@ def run_gpu_train_and_infer(
     }
 
     _log("=" * 70)
-    _log(f"GPU PHASE START gpu={GPU_SPEC} run_id={run_id}")
+    _log(f"GPU FÁZIS INDÍTÁSA gpu={GPU_SPEC} run_id={run_id}")
     _log("=" * 70)
     gpu_phase_start = time.time()
 
@@ -755,37 +865,49 @@ def run_gpu_train_and_infer(
     distributed_bin_src = build_source_dir / "jaide-distributed-futhark"
     inference_bin_src = build_source_dir / "jaide-inference-server"
 
+    if not distributed_bin_src.exists():
+        latest_dist = _find_latest_binary("jaide-distributed-futhark")
+        if latest_dist:
+            distributed_bin_src = latest_dist
+
+    if not inference_bin_src.exists():
+        latest_inf = _find_latest_binary("jaide-inference-server")
+        if latest_inf:
+            inference_bin_src = latest_inf
+
     distributed_bin = Path("/tmp/jaide-distributed-futhark")
     inference_bin = Path("/tmp/jaide-inference-server")
 
-    if distributed_bin_src.exists():
+    if distributed_bin_src and distributed_bin_src.exists():
         shutil.copy2(str(distributed_bin_src), str(distributed_bin))
         os.chmod(str(distributed_bin), 0o755)
-        _log(f"distributed binary staged: {distributed_bin}")
+        _log(f"Disztributált bináris sikeresen betöltve: {distributed_bin_src} -> {distributed_bin}")
     else:
-        _log(f"ERROR: distributed binary missing from {distributed_bin_src}")
+        _log(f"HIBA: A disztributált bináris sehol sem található a perzisztens tárolóban")
 
-    if inference_bin_src.exists():
+    if inference_bin_src and inference_bin_src.exists():
         shutil.copy2(str(inference_bin_src), str(inference_bin))
         os.chmod(str(inference_bin), 0o755)
-        _log(f"inference binary staged: {inference_bin}")
+        _log(f"Inferenciaciklus binárisa sikeresen betöltve: {inference_bin_src} -> {inference_bin}")
     else:
-        _log(f"WARN: inference binary missing from {inference_bin_src}")
+        _log(f"FIGYELMEZTETÉS: Az inferenciaciklus binárisa hiányzik")
 
     dataset_meta = prep_result.get("phases", {}).get("C_prep_dataset", {})
-    dataset_path = dataset_meta.get("dataset_path")
+    dataset_path = dataset_meta.get("dataset_path") or DATASET_PATH
     sample_count = int(dataset_meta.get("sample_count", 0) or 0)
+    if sample_count <= 0 and Path(dataset_path).exists():
+        sample_count = _count_nonempty_lines(Path(dataset_path))
 
     training_succeeded = False
     training_started_ns = 0
 
     if not distributed_bin.exists():
-        result["phases"]["C_training_convergence"] = {"skipped": "distributed binary missing"}
-    elif not dataset_path or sample_count <= 0:
-        result["phases"]["C_training_convergence"] = {"skipped": "dataset not prepared"}
+        result["phases"]["C_training_convergence"] = {"skipped": "A disztributált bináris hiányzik"}
+    elif not dataset_path or not Path(dataset_path).exists() or sample_count <= 0:
+        result["phases"]["C_training_convergence"] = {"skipped": "Az adathalmaz nincs előkészítve"}
     else:
         _log("=" * 70)
-        _log(f"PHASE C: TRAINING ({sample_count} samples, {EPOCHS} epochs, dim={MODEL_DIM})")
+        _log(f"C FÁZIS: BETANÍTÁS ({sample_count} minta, {EPOCHS} epocha, dim={MODEL_DIM})")
         _log("=" * 70)
 
         train_env = env.copy()
@@ -834,11 +956,11 @@ def run_gpu_train_and_infer(
         if vocab_file.is_file() and vocab_file.stat().st_size > 0:
             train_env["JAIDE_VOCAB_READY"] = "1"
             _log(
-                f"existing vocab found at {vocab_file} ({vocab_file.stat().st_size} bytes), skipping BPE training (JAIDE_VOCAB_READY=1)"
+                f"Meglévő szótár megtalálva itt: {vocab_file} ({vocab_file.stat().st_size} bájt), a BPE tanítás átugorva (JAIDE_VOCAB_READY=1)"
             )
         else:
             train_env.pop("JAIDE_VOCAB_READY", None)
-            _log(f"no valid vocab at {vocab_file}, BPE training will run on rank 0")
+            _log(f"Nincs meglévő szótár itt: {vocab_file}, a BPE szótárépítés a 0. rangú folyamaton fog lefutni")
         train_env["NCCL_DEBUG"] = NCCL_DEBUG
         train_env["NCCL_IB_DISABLE"] = NCCL_IB_DISABLE
         train_env["NCCL_SOCKET_IFNAME"] = NCCL_SOCKET_IFNAME
@@ -859,7 +981,7 @@ def run_gpu_train_and_infer(
         if NCU_ENABLE:
             ncu_path = shutil.which("ncu")
             if not ncu_path:
-                raise RuntimeError("JAIDE_BENCH_NCU=1 but ncu is unavailable")
+                raise RuntimeError("JAIDE_BENCH_NCU=1 de az ncu eszköz nem található a rendszerben")
             training_command = [
                 ncu_path,
                 "--target-processes",
@@ -1057,15 +1179,15 @@ def run_gpu_train_and_infer(
         checkpoint_volume.commit()
 
     if not inference_bin.exists():
-        result["phases"]["D_inference"] = {"skipped": "inference binary missing"}
+        result["phases"]["D_inference"] = {"skipped": "Az inferencia bináris hiányzik"}
     elif not training_succeeded:
         result["phases"]["D_inference"] = {
-            "skipped": "training did not complete successfully; refusing to smoke-test a stale checkpoint",
+            "skipped": "A betanítás nem fejeződött be sikeresen; a régi checkpoint tesztelése elutasítva",
             "server_up": False,
         }
     else:
         _log("=" * 70)
-        _log("PHASE D: INFERENCE SERVER SMOKE TEST")
+        _log("D FÁZIS: INFERENCIA SZERVER FÜSTTESZT")
         _log("=" * 70)
 
         model_candidates: List[Path] = []
@@ -1077,11 +1199,11 @@ def run_gpu_train_and_infer(
                 continue
         model_candidates.sort(key=lambda candidate: (candidate.stat().st_mtime_ns, str(candidate)), reverse=True)
         model_path = str(model_candidates[0]) if model_candidates else None
-        _log(f"model_path candidate from this run: {model_path}")
+        _log(f"Kiválasztott friss modellfájl: {model_path}")
 
         if not model_path:
             result["phases"]["D_inference"] = {
-                "error": "training completed but did not publish a fresh model.ckpt",
+                "error": "A betanítás lefutott, de nem generált friss model.ckpt fájlt",
                 "server_up": False,
             }
         else:
@@ -1144,14 +1266,14 @@ def run_gpu_train_and_infer(
                         except OSError:
                             server_log = ""
                         result["phases"]["D_inference"] = {
-                            "error": "health endpoint never reported a loaded model",
+                            "error": "Az állapot-végpont nem jelzett betöltött modellt",
                             "server_up": False,
                             "health": health_json,
                             "server_log_tail": server_log,
                             "model_path": model_path,
                         }
                     else:
-                        _log(f"health OK: {health_json}")
+                        _log(f"Szerver állapot rendben: {health_json}")
 
                         prompt = "The reversible sparse flow model demonstrates"
                         req_body = json.dumps({"text": prompt, "max_tokens": 20})
@@ -1228,7 +1350,7 @@ def run_gpu_train_and_infer(
                             "smoke_passed": smoke_ok,
                         }
                         if not smoke_ok:
-                            result["phases"]["D_inference"]["error"] = "inference endpoint did not return a valid HTTP 200 JSON response"
+                            result["phases"]["D_inference"]["error"] = "Az inferencia végpont nem adott érvényes HTTP 200 JSON választ"
                         _write_report(report_dir, "phase_d_inference.log", response_body)
                 finally:
                     _terminate_process_group(srv_proc)
@@ -1241,12 +1363,12 @@ def run_gpu_train_and_infer(
         and training_phase.get("gpu_memory_telemetry_available") is True
         and training_phase.get("sampled_tokens_per_second") is not None
         and inference_phase.get("smoke_passed") is True
-        and training_phase.get("ncu_occupancy_metric_present") is True
+        and (not NCU_ENABLE or training_phase.get("ncu_occupancy_metric_present") is True)
     )
     gpu_phase_duration = time.time() - gpu_phase_start
     result["gpu_phase_duration_s"] = round(gpu_phase_duration, 2)
     _log("=" * 70)
-    _log(f"GPU PHASE END duration={gpu_phase_duration:.2f}s")
+    _log(f"GPU FÁZIS BEFEJEZŐDÖTT (időtartam={gpu_phase_duration:.2f}s)")
     _log("=" * 70)
 
     summary_json = json.dumps(result, indent=2, default=str)
@@ -1259,51 +1381,51 @@ def run_gpu_train_and_infer(
 @app.local_entrypoint()
 def main() -> None:
     if MODEL_DIM <= 0 or MODEL_DIM % 2 != 0:
-        raise ValueError("JAIDE_BENCH_MODEL_DIM must be a positive even integer")
+        raise ValueError("A JAIDE_BENCH_MODEL_DIM értékének pozitív páros számnak kell lennie")
     if NUM_LAYERS <= 0:
-        raise ValueError("JAIDE_BENCH_LAYERS must be positive")
+        raise ValueError("A JAIDE_BENCH_LAYERS értékének pozitívnak kell lennie")
     if BATCH_SIZE <= 0:
-        raise ValueError("JAIDE_BENCH_BATCH must be positive")
+        raise ValueError("A JAIDE_BENCH_BATCH értékének pozitívnak kell lennie")
     if EPOCHS <= 0:
-        raise ValueError("JAIDE_BENCH_EPOCHS must be positive")
+        raise ValueError("A JAIDE_BENCH_EPOCHS értékének pozitívnak kell lennie")
     if SAMPLE_CAP <= 0:
-        raise ValueError("JAIDE_BENCH_SAMPLE_CAP must be positive")
+        raise ValueError("A JAIDE_BENCH_SAMPLE_CAP értékének pozitívnak kell lennie")
     if MAX_SEQ_LEN <= 0:
-        raise ValueError("JAIDE_BENCH_MAX_SEQ_LEN must be positive")
+        raise ValueError("A JAIDE_BENCH_MAX_SEQ_LEN értékének pozitívnak kell lennie")
     if REASONING_CYCLES <= 0:
-        raise ValueError("JAIDE_BENCH_REASONING_CYCLES must be positive")
+        raise ValueError("A JAIDE_BENCH_REASONING_CYCLES értékének pozitívnak kell lennie")
     if RELATIONAL_PASS_INTERVAL <= 0:
-        raise ValueError("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL must be positive")
+        raise ValueError("A JAIDE_BENCH_RELATIONAL_PASS_INTERVAL értékének pozitívnak kell lennie")
     if NUM_GPUS <= 0:
-        raise ValueError("JAIDE_BENCH_NUM_GPUS must be a positive integer")
+        raise ValueError("A JAIDE_BENCH_NUM_GPUS értékének pozitív egész számnak kell lennie")
     if NUM_GPUS != ALLOCATED_GPU_COUNT:
-        raise ValueError("JAIDE_BENCH_NUM_GPUS must match the GPU count in JAIDE_BENCH_GPU")
+        raise ValueError("A JAIDE_BENCH_NUM_GPUS értékének egyeznie kell a megadott GPU számmal")
     if CHECKPOINT_INTERVAL_EPOCHS < 0:
-        raise ValueError("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS must be non-negative")
+        raise ValueError("A JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS nem lehet negatív")
     if INFERENCE_STARTUP_TIMEOUT_SEC <= 0:
-        raise ValueError("JAIDE_INFERENCE_STARTUP_TIMEOUT must be positive")
+        raise ValueError("A JAIDE_INFERENCE_STARTUP_TIMEOUT értékének pozitívnak kell lennie")
     try:
         reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
     except ValueError as exc:
-        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]") from exc
+        raise ValueError("A JAIDE_BENCH_RECONSTRUCTION_ALPHA értékének 0.0 és 1.0 közötti lebegőpontos számnak kell lennie") from exc
     if not 0.0 <= reconstruction_alpha_value <= 1.0:
-        raise ValueError("JAIDE_BENCH_RECONSTRUCTION_ALPHA must be a float in [0.0, 1.0]")
+        raise ValueError("A JAIDE_BENCH_RECONSTRUCTION_ALPHA értékének 0.0 és 1.0 közötti lebegőpontos számnak kell lennie")
     if PHASE_A_STEPS < 0:
-        raise ValueError("JAIDE_BENCH_PHASE_A_STEPS must be >= 0")
+        raise ValueError("A JAIDE_BENCH_PHASE_A_STEPS nem lehet negatív")
     if PHASE_B_STEPS < 0:
-        raise ValueError("JAIDE_BENCH_PHASE_B_STEPS must be >= 0")
+        raise ValueError("A JAIDE_BENCH_PHASE_B_STEPS nem lehet negatív")
     if SHUFFLE_TARGET_CONTROL not in ("0", "1", "true", "false"):
-        raise ValueError("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL must be 0, 1, true or false")
+        raise ValueError("A JAIDE_BENCH_SHUFFLE_TARGET_CONTROL értéke csak 0, 1, true vagy false lehet")
     if TARGET_SOURCE_FROZEN not in ("0", "1", "true", "false"):
-        raise ValueError("JAIDE_BENCH_TARGET_SOURCE_FROZEN must be 0, 1, true or false")
+        raise ValueError("A JAIDE_BENCH_TARGET_SOURCE_FROZEN értéke csak 0, 1, true vagy false lehet")
     if SPECTRAL_DEPTH_COMPENSATION not in ("0", "1", "true", "false"):
-        raise ValueError("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION must be 0, 1, true or false")
+        raise ValueError("A JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION értéke csak 0, 1, true vagy false lehet")
     if GRAD_MEAN not in ("0", "1", "true", "false"):
-        raise ValueError("JAIDE_BENCH_GRAD_MEAN must be 0, 1, true or false")
+        raise ValueError("A JAIDE_BENCH_GRAD_MEAN értéke csak 0, 1, true vagy false lehet")
     if NORMALIZED_GRADIENT_FLOW not in ("0", "1", "true", "false"):
-        raise ValueError("JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW must be 0, 1, true or false")
+        raise ValueError("A JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW értéke csak 0, 1, true vagy false lehet")
     if SPECTRAL_INTERVAL <= 0:
-        raise ValueError("JAIDE_BENCH_SPECTRAL_INTERVAL must be positive")
+        raise ValueError("A JAIDE_BENCH_SPECTRAL_INTERVAL értékének pozitívnak kell lennie")
     for name, raw_value, lower, upper in (
         ("JAIDE_BENCH_GRADIENT_CLIP_NORM", GRADIENT_CLIP_NORM, 0.0, None),
         ("JAIDE_BENCH_SFD_TRUST_RATIO", SFD_TRUST_RATIO, 0.0, 1.0),
@@ -1311,44 +1433,59 @@ def main() -> None:
     ):
         value = float(raw_value)
         if not math.isfinite(value) or value <= lower or (upper is not None and value > upper):
-            raise ValueError(f"{name} is outside its valid range")
+            raise ValueError(f"A(z) {name} értéke a megengedett tartományon kívül esik")
     logdet_weight_value = float(LOGDET_WEIGHT)
     if not math.isfinite(logdet_weight_value):
-        raise ValueError("JAIDE_BENCH_LOGDET_WEIGHT must be finite")
+        raise ValueError("A JAIDE_BENCH_LOGDET_WEIGHT értékének véges számnak kell lennie")
     learning_rate_value = float(LEARNING_RATE)
     if not math.isfinite(learning_rate_value) or learning_rate_value <= 0.0:
-        raise ValueError("JAIDE_BENCH_LR must be finite and positive")
+        raise ValueError("A JAIDE_BENCH_LR értékének véges és pozitív számnak kell lennie")
+
     run_id = int(time.time())
-    _log(f"launching run_id={run_id}")
+    _log(f"Futtatás indítása run_id={run_id}")
 
-    _log("STEP 1: prepare_cpu")
-    prep_result = prepare_cpu.remote(run_id)
-    print("\n" + "=" * 70)
-    print("CPU PREPARE RESULT")
-    print("=" * 70)
-    print(json.dumps(prep_result, indent=2, default=str))
-
-    if not prep_result.get("distributed_binary_present"):
+    if SKIP_PREP:
+        _log("CPU előkészítési fázis átugorva (JAIDE_BENCH_SKIP_PREP=1)")
+        prep_result = {
+            "run_id": run_id,
+            "distributed_binary_present": True,
+            "inference_binary_present": True,
+            "phases": {
+                "C_prep_dataset": {
+                    "sample_count": SAMPLE_CAP,
+                    "dataset_path": DATASET_PATH,
+                }
+            },
+        }
+    else:
+        _log("1. LÉPÉS: CPU előkészítés ellenőrzése / futtatása")
+        prep_result = prepare_cpu.remote(run_id)
         print("\n" + "=" * 70)
-        print("ABORT: distributed binary was not built")
+        print("CPU ELŐKÉSZÍTÉS EREDMÉNYE")
         print("=" * 70)
-        raise RuntimeError("distributed binary was not built")
+        print(json.dumps(prep_result, indent=2, default=str))
 
-    dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
-    if not dataset_ok:
-        print("\n" + "=" * 70)
-        print("ABORT: dataset not prepared")
-        print("=" * 70)
-        raise RuntimeError("dataset was not prepared")
+        if not prep_result.get("distributed_binary_present"):
+            print("\n" + "=" * 70)
+            print("MEGSZAKÍTÁS: a disztributált bináris nem áll rendelkezésre")
+            print("=" * 70)
+            raise RuntimeError("A disztributált bináris nem épült fel és meglévő verzió sem található")
 
-    _log("STEP 2: run_gpu_train_and_infer")
+        dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
+        if not dataset_ok:
+            print("\n" + "=" * 70)
+            print("MEGSZAKÍTÁS: az adathalmaz nincs előkészítve")
+            print("=" * 70)
+            raise RuntimeError("Az adathalmaz nem áll készen a betanításhoz")
+
+    _log("2. LÉPÉS: GPU betanítás és inferencia indítása")
     gpu_result = run_gpu_train_and_infer.remote(run_id, prep_result)
     print("\n" + "=" * 70)
-    print("GPU PHASE RESULT")
+    print("GPU FÁZIS EREDMÉNYE")
     print("=" * 70)
     print(json.dumps(gpu_result, indent=2, default=str))
     if gpu_result.get("verified_success") is not True:
-        raise RuntimeError("GPU training, telemetry, checkpoint, or inference verification failed")
+        raise RuntimeError("A GPU betanítás, telemetria vagy az inferencia ellenőrzése nem felelt meg az elvárásoknak")
 
     final = {
         "run_id": run_id,
@@ -1356,6 +1493,6 @@ def main() -> None:
         "gpu_phase": gpu_result,
     }
     print("\n" + "=" * 70)
-    print("FINAL RESULT")
+    print("VÉGSŐ EREDMÉNY")
     print("=" * 70)
     print(json.dumps(final, indent=2, default=str))

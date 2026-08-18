@@ -1,16 +1,61 @@
-entrypoint = "main.py"
-modules = ["python-3.11"]
+modules = ["python-base-3.11"]
+
+[agent]
+expertMode = true
+
+entrypoint = "scripts/modal_status_bench.py"
+hidden = [".zig-cache", "zig-out", ".venv", "__pycache__"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["zig", "haskellPackages.futhark"]
+packages = ["zig", "haskellPackages.futhark", "uv"]
 
-[unitTest]
-language = "python3"
+[deployment]
+run = ["python", "scripts/modal_status_bench.py"]
+deploymentTarget = "cloudrun"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Modal Report Volume Ls"
+mode = "sequential"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run modal volume ls jaide-bench-reports"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Modal Report Volume Ls"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Modal Status Bench"
+
+[[workflows.workflow]]
+name = "Run Modal Status Bench"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run modal run --detach scripts/modal_status_bench.py"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
 
 [gitHubImport]
 requiredFiles = [".replit", "replit.nix"]
-
-[deployment]
-run = ["python3", "main.py"]
-deploymentTarget = "cloudrun"

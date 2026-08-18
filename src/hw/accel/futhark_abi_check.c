@@ -48,7 +48,7 @@ typedef int (*embedding_backward_padded_type)(
 typedef int (*clip_matrix_type)(
     struct futhark_context *,
     struct futhark_f32_2d **,
-    struct futhark_f32_2d *,
+    const struct futhark_f32_2d *,
     float
 );
 
