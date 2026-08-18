@@ -3,10 +3,12 @@ const cuda = @import("cuda_bindings.zig");
 const futhark = @import("futhark_bindings.zig");
 const core_tensor = @import("../../core/tensor.zig");
 const core_memory = @import("../../core/memory.zig");
+const gpu_memory = @import("gpu_memory.zig");
 
 pub const gpu_enabled: bool = @import("build_options").gpu_acceleration;
 
 pub const AccelError = error{
+    StackOnlyModeActive,
     FutharkConfigFailed,
     FutharkContextFailed,
     FutharkSyncFailed,
@@ -666,6 +668,7 @@ pub const RSFAccelerator = struct {
     stack_fisher_t: ?FutharkArray3DF32 = null,
     stack_arrays_valid: bool = false,
     layers_mirror_valid: bool = true,
+    stack_only: bool = false,
     optimizer_step: u64 = 0,
     last_spectral_before: f32 = 0.0,
     last_spectral_after: f32 = 0.0,
@@ -686,6 +689,25 @@ pub const RSFAccelerator = struct {
         allocator: std.mem.Allocator,
         depth_compensation: bool,
     ) AccelError!Self {
+        return initInternal(model_dim, num_layers, allocator, depth_compensation, false);
+    }
+
+    pub fn initStackOnly(
+        model_dim: usize,
+        num_layers: usize,
+        allocator: std.mem.Allocator,
+        depth_compensation: bool,
+    ) AccelError!Self {
+        return initInternal(model_dim, num_layers, allocator, depth_compensation, true);
+    }
+
+    fn initInternal(
+        model_dim: usize,
+        num_layers: usize,
+        allocator: std.mem.Allocator,
+        depth_compensation: bool,
+        stack_only: bool,
+    ) AccelError!Self {
         if (model_dim == 0) return AccelError.InvalidDimensions;
         if (model_dim % 2 != 0) return AccelError.InvalidDimensions;
         if (num_layers == 0) return AccelError.InvalidDimensions;
@@ -701,7 +723,8 @@ pub const RSFAccelerator = struct {
             1.0;
         const init_stddev: f32 = depth_scale * 0.25 / @sqrt(@as(f32, @floatFromInt(half)));
 
-        var layers = allocator.alloc(RSFLayer, num_layers) catch return AccelError.AllocationFailed;
+        const mirror_count: usize = if (stack_only) 0 else num_layers;
+        var layers = allocator.alloc(RSFLayer, mirror_count) catch return AccelError.AllocationFailed;
         errdefer allocator.free(layers);
 
         const columns = std.math.add(usize, half, 1) catch return AccelError.InvalidDimensions;
@@ -748,11 +771,13 @@ pub const RSFAccelerator = struct {
                 shadow_s_data[bias_index] = 0.0;
                 shadow_t_data[bias_index] = 0.0;
             }
-            var layer_s = try FutharkArray2DF16.newFromFlat(&ctx, shadow_s_data[base .. base + per_layer], half, columns);
-            errdefer layer_s.free(&ctx);
-            const layer_t = try FutharkArray2DF16.newFromFlat(&ctx, shadow_t_data[base .. base + per_layer], half, columns);
-            layers[layer_index] = .{ .weights_s = layer_s, .weights_t = layer_t };
-            layers_built += 1;
+            if (!stack_only) {
+                var layer_s = try FutharkArray2DF16.newFromFlat(&ctx, shadow_s_data[base .. base + per_layer], half, columns);
+                errdefer layer_s.free(&ctx);
+                const layer_t = try FutharkArray2DF16.newFromFlat(&ctx, shadow_t_data[base .. base + per_layer], half, columns);
+                layers[layer_index] = .{ .weights_s = layer_s, .weights_t = layer_t };
+                layers_built += 1;
+            }
         }
 
         var stack_master_s = try FutharkArray3DF32.newFromFlat(&ctx, master_s_data, num_layers, half, columns);
@@ -797,8 +822,26 @@ pub const RSFAccelerator = struct {
             .stack_fisher_s = fisher_s,
             .stack_fisher_t = fisher_t,
             .stack_arrays_valid = true,
-            .layers_mirror_valid = true,
+            .layers_mirror_valid = !stack_only,
+            .stack_only = stack_only,
         };
+    }
+
+    pub fn mirrorArrayCount(self: *const Self) usize {
+        return self.layers.len * 2;
+    }
+
+    pub fn isStackOnly(self: *const Self) bool {
+        return self.stack_only;
+    }
+
+    pub fn deviceStackBytes(self: *const Self) AccelError!usize {
+        const footprint = gpu_memory.stackFootprint(
+            self.model_dim,
+            self.num_layers,
+            self.layers.len,
+        ) catch return AccelError.InvalidDimensions;
+        return footprint.total();
     }
 
     pub fn deinit(self: *Self) void {
@@ -849,6 +892,7 @@ pub const RSFAccelerator = struct {
 
     pub fn layerPtr(self: *Self, layer_idx: usize) AccelError!*RSFLayer {
         if (!self.initialized) return AccelError.NullPointer;
+        if (self.stack_only) return AccelError.StackOnlyModeActive;
         if (layer_idx >= self.layers.len) return AccelError.InvalidDimensions;
         return &self.layers[layer_idx];
     }
@@ -857,11 +901,21 @@ pub const RSFAccelerator = struct {
         return state.dim0 == layers and state.dim1 == half and state.dim2 == cols and state.arr != null;
     }
 
-    fn ensureStackPacked(self: *Self) AccelError!void {
-        if (self.stack_arrays_valid and self.stack_weights_s != null and self.stack_weights_t != null and
+    fn stackArraysComplete(self: *const Self) bool {
+        return self.stack_weights_s != null and self.stack_weights_t != null and
             self.stack_master_weights_s != null and self.stack_master_weights_t != null and
             self.stack_momentum_s != null and self.stack_momentum_t != null and
-            self.stack_fisher_s != null and self.stack_fisher_t != null) return;
+            self.stack_fisher_s != null and self.stack_fisher_t != null;
+    }
+
+    fn ensureStackPacked(self: *Self) AccelError!void {
+        if (self.stack_arrays_valid and self.stackArraysComplete()) return;
+
+        if (self.stack_only) {
+            if (!self.stackArraysComplete()) return AccelError.NullPointer;
+            self.stack_arrays_valid = true;
+            return;
+        }
 
         const l_count = self.layers.len;
         const half = self.model_dim / 2;
@@ -933,6 +987,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn syncLayersFromStack(self: *Self) AccelError!void {
+        if (self.stack_only) return;
         if (!self.stack_arrays_valid) return;
         if (self.layers_mirror_valid) return;
         const half = self.model_dim / 2;
@@ -1039,6 +1094,7 @@ pub const RSFAccelerator = struct {
         if (!self.initialized) return AccelError.NullPointer;
         if (self.ctx.ctx == null) return AccelError.NullPointer;
         if (input.arr == null) return AccelError.NullPointer;
+        if (self.stack_only) return AccelError.StackOnlyModeActive;
         if (self.layers.len == 0) return AccelError.NullPointer;
         self.ctx.mutex.lock();
         defer self.ctx.mutex.unlock();
@@ -1365,6 +1421,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn setLayerWeightsS(self: *Self, layer_idx: usize, data: []const f16, rows: usize, cols: usize) AccelError!void {
+        if (self.stack_only) return AccelError.StackOnlyModeActive;
         const total = std.math.mul(usize, rows, cols) catch return AccelError.InvalidDimensions;
         if (rows == 0 or cols == 0 or data.len != total) return AccelError.InvalidDimensions;
         try self.syncLayersFromStack();
@@ -1377,6 +1434,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn setLayerWeightsT(self: *Self, layer_idx: usize, data: []const f16, rows: usize, cols: usize) AccelError!void {
+        if (self.stack_only) return AccelError.StackOnlyModeActive;
         const total = std.math.mul(usize, rows, cols) catch return AccelError.InvalidDimensions;
         if (rows == 0 or cols == 0 or data.len != total) return AccelError.InvalidDimensions;
         try self.syncLayersFromStack();

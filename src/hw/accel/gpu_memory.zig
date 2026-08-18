@@ -216,6 +216,38 @@ pub fn estimate(shape: ModelShape) MemoryEstimateError!Estimate {
     return result;
 }
 
+pub const StackFootprint = struct {
+    shadow_bytes: usize,
+    master_bytes: usize,
+    mirror_bytes: usize,
+
+    pub fn total(self: StackFootprint) usize {
+        return self.shadow_bytes + self.master_bytes + self.mirror_bytes;
+    }
+};
+
+pub fn stackFootprint(
+    model_dim: usize,
+    num_layers: usize,
+    mirror_layers: usize,
+) MemoryEstimateError!StackFootprint {
+    if (model_dim == 0 or model_dim % 2 != 0) return MemoryEstimateError.InvalidDimensions;
+    if (num_layers == 0) return MemoryEstimateError.InvalidDimensions;
+    if (mirror_layers > num_layers) return MemoryEstimateError.InvalidDimensions;
+
+    const half = model_dim / 2;
+    const cols = try add(half, 1);
+    const per_layer = try mul(half, cols);
+    const stack_elems = try mul(num_layers, per_layer);
+    const mirror_elems = try mul(mirror_layers, per_layer);
+
+    return .{
+        .shadow_bytes = try mul(stack_elems, 2 * bytes_per_f16),
+        .master_bytes = try mul(stack_elems, 6 * bytes_per_f32),
+        .mirror_bytes = try mul(mirror_elems, 2 * bytes_per_f16),
+    };
+}
+
 pub const PreflightConfig = struct {
     reserve_bytes: usize = 512 * bytes_per_mib,
     reserve_fraction: f64 = 0.05,
@@ -562,4 +594,35 @@ test "chunked graph staging never scales with total node count" {
         .graph_chunk_size = 0,
     });
     try std.testing.expect(chunked.transient_bytes < unchunked.transient_bytes);
+}
+
+test "stack footprint drops the mirror block in stack only mode" {
+    const wide = try stackFootprint(16384, 11, 11);
+    const lean = try stackFootprint(16384, 11, 0);
+
+    try std.testing.expectEqual(@as(usize, 2_953_150_464), wide.mirror_bytes);
+    try std.testing.expectEqual(@as(usize, 0), lean.mirror_bytes);
+    try std.testing.expectEqual(wide.shadow_bytes, lean.shadow_bytes);
+    try std.testing.expectEqual(wide.master_bytes, lean.master_bytes);
+    try std.testing.expectEqual(wide.total() - 2_953_150_464, lean.total());
+}
+
+test "stack footprint matches the documented per component sizes" {
+    const f = try stackFootprint(16384, 11, 0);
+    try std.testing.expectEqual(@as(usize, 738_287_616 * 2 * 2), f.shadow_bytes);
+    try std.testing.expectEqual(@as(usize, 738_287_616 * 6 * 4), f.master_bytes);
+}
+
+test "stack footprint validates dimensions and mirror count" {
+    try std.testing.expectError(MemoryEstimateError.InvalidDimensions, stackFootprint(0, 2, 0));
+    try std.testing.expectError(MemoryEstimateError.InvalidDimensions, stackFootprint(15, 2, 0));
+    try std.testing.expectError(MemoryEstimateError.InvalidDimensions, stackFootprint(16, 0, 0));
+    try std.testing.expectError(MemoryEstimateError.InvalidDimensions, stackFootprint(16, 2, 3));
+}
+
+test "stack footprint reports overflow rather than wrapping" {
+    try std.testing.expectError(
+        MemoryEstimateError.SizeOverflow,
+        stackFootprint(std.math.maxInt(usize) - 1, 2, 0),
+    );
 }

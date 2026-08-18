@@ -178,6 +178,7 @@ pub const TrainerConfig = struct {
     shuffle_target_control: bool = false,
     target_source_frozen: bool = true,
     spectral_depth_compensation: bool = true,
+    stack_only_accelerator: bool = true,
     logdet_weight: f32 = fused_logdet_weight_default,
     fisher_gamma: f32 = sfd_fisher_gamma_default,
     fisher_epsilon: f32 = sfd_fisher_epsilon_default,
@@ -654,14 +655,40 @@ pub const DistributedTrainerFuthark = struct {
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
-        accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
-            actual_model_dim,
-            num_layers,
-            allocator,
-            config.spectral_depth_compensation,
-        );
+        accelerator_ptr.* = if (config.stack_only_accelerator)
+            try RSFAccelerator.initStackOnly(
+                actual_model_dim,
+                num_layers,
+                allocator,
+                config.spectral_depth_compensation,
+            )
+        else
+            try RSFAccelerator.initMultiLayerWithDepthScale(
+                actual_model_dim,
+                num_layers,
+                allocator,
+                config.spectral_depth_compensation,
+            );
         var accelerator_committed = false;
         errdefer if (!accelerator_committed) accelerator_ptr.deinit();
+        {
+            const stack_bytes = try accelerator_ptr.deviceStackBytes();
+            std.debug.print(
+                "[Rank {d}] RSFAccelerator mode={s} layers={d} model_dim={d} mirror_arrays={d} device_stack_bytes={d} ({d:.3} GiB)\n",
+                .{
+                    coordinator.rank,
+                    if (accelerator_ptr.isStackOnly()) "stack-only" else "mirrored",
+                    num_layers,
+                    actual_model_dim,
+                    accelerator_ptr.mirrorArrayCount(),
+                    stack_bytes,
+                    @as(f64, @floatFromInt(stack_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                },
+            );
+            if (config.stack_only_accelerator and accelerator_ptr.mirrorArrayCount() != 0) {
+                return TrainerError.InvalidModelDim;
+            }
+        }
         try accelerator_ptr.setClipRange(
             try checkedF32ToF16(config.clip_min),
             try checkedF32ToF16(config.clip_max),
@@ -2498,12 +2525,20 @@ pub const DistributedTrainerFuthark = struct {
         var new_accelerator_ptr = try self.allocator.create(RSFAccelerator);
         var new_accelerator_ptr_committed = false;
         errdefer if (!new_accelerator_ptr_committed) self.allocator.destroy(new_accelerator_ptr);
-        new_accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
-            self.model_dim,
-            self.num_layers,
-            self.allocator,
-            self.config.spectral_depth_compensation,
-        );
+        new_accelerator_ptr.* = if (self.config.stack_only_accelerator)
+            try RSFAccelerator.initStackOnly(
+                self.model_dim,
+                self.num_layers,
+                self.allocator,
+                self.config.spectral_depth_compensation,
+            )
+        else
+            try RSFAccelerator.initMultiLayerWithDepthScale(
+                self.model_dim,
+                self.num_layers,
+                self.allocator,
+                self.config.spectral_depth_compensation,
+            );
         var new_accelerator_committed = false;
         errdefer if (!new_accelerator_committed) new_accelerator_ptr.deinit();
 

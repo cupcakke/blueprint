@@ -171,6 +171,7 @@ pub fn build(b: *std.Build) void {
         .{ .step = "test-sfd", .wrapper = "src/test_root_sfd.zig", .desc = "Run SFD optimizer tests" },
         .{ .step = "test-embedding", .wrapper = "src/test_root_embedding.zig", .desc = "Run embedding tests" },
         .{ .step = "test-rsf", .wrapper = "src/test_root_rsf.zig", .desc = "Run RSF tests" },
+        .{ .step = "test-accel-stack", .wrapper = "src/test_root_accel_stack.zig", .desc = "Run stack-only RSF accelerator tests" },
         .{ .step = "test-oftb", .wrapper = "src/test_root_oftb.zig", .desc = "Run OFTB tests" },
         .{ .step = "test-nsir", .wrapper = "src/test_root_nsir.zig", .desc = "Run NSIR graph tests" },
         .{ .step = "test-reasoning", .wrapper = "src/test_root_reasoning.zig", .desc = "Run reasoning orchestrator tests" },
