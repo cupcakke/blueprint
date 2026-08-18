@@ -8,6 +8,8 @@ const FutharkArray2DF16 = accel.FutharkArray2DF16;
 const FutharkArray3DF16 = accel.FutharkArray3DF16;
 const PinnedMemory = accel.PinnedMemory;
 const futhark = @import("../hw/accel/futhark_bindings.zig");
+const gpu_memory_model = @import("../hw/accel/gpu_memory_model.zig");
+const cuda_bindings = @import("../hw/accel/cuda_bindings.zig");
 const core_relational = @import("../core_relational/mod.zig");
 const CREVPipeline = core_relational.CREVPipeline;
 const ChaosCoreKernel = core_relational.ChaosCoreKernel;
@@ -144,7 +146,10 @@ pub const TrainerConfig = struct {
     fnds_kg_branching: usize = 3,
     knowledge_fnds_index_name: []const u8 = "knowledge_graph_patterns",
     embedding_seed: u64 = 42,
-    spectral_iterations: usize = 30,
+    spectral_iterations: usize = 1,
+    spectral_startup_iterations: usize = 0,
+    spectral_periodic_iterations: usize = 1,
+    spectral_full_recalibration: bool = false,
     spectral_target_norm: f32 = 0.9,
     gradient_clip_norm: f32 = 1.0,
     clip_min: f32 = -5.0,
@@ -184,6 +189,11 @@ pub const TrainerConfig = struct {
     trust_ratio: f32 = 0.1,
     weight_floor: f32 = 1e-3,
     spectral_interval: u64 = 10,
+    stack_only_rsf: bool = true,
+    memory_preflight_enabled: bool = true,
+    memory_reserve_mib: u64 = 4096,
+    memory_reserve_fraction: f64 = 0.05,
+    graph_chunk_size: usize = 65536,
 };
 
 pub const TrainerComponents = struct {
@@ -259,6 +269,7 @@ pub const TrainerError = error{
     CheckpointSaveMustRunOnRoot,
     StepSynchronizerUnavailable,
     InvalidTrainingState,
+    MemoryPreflightRejected,
 };
 
 fn createConfiguredTokenizer(
@@ -482,14 +493,17 @@ const StepSynchronizer = struct {
 
         if (job.apply_spectral) {
             const spectral_started = std.time.nanoTimestamp();
-            try trainer.accelerator.spectralNormalizeLayers(
-                trainer.config.spectral_target_norm,
-                trainer.config.spectral_iterations,
-            );
-            try trainer.applyEmbeddingSpectralNormalization();
-            if (trainer.coordinator.isRoot()) {
-                const spectral_elapsed = std.time.nanoTimestamp() - spectral_started;
-                std.debug.print("[Rank 0] Step {d} spectral_ms={d}\n", .{ job.step, @divTrunc(spectral_elapsed, std.time.ns_per_ms) });
+            const periodic_iterations = if (trainer.config.spectral_full_recalibration) trainer.config.spectral_startup_iterations else trainer.config.spectral_periodic_iterations;
+            if (periodic_iterations > 0) {
+                try trainer.accelerator.spectralNormalizeLayers(
+                    trainer.config.spectral_target_norm,
+                    periodic_iterations,
+                );
+                try trainer.applyEmbeddingSpectralNormalization();
+                if (trainer.coordinator.isRoot()) {
+                    const spectral_elapsed = std.time.nanoTimestamp() - spectral_started;
+                    std.debug.print("[Rank 0] Step {d} spectral_ms={d} iterations={d}\n", .{ job.step, @divTrunc(spectral_elapsed, std.time.ns_per_ms), periodic_iterations });
+                }
             }
         }
 
@@ -562,7 +576,7 @@ pub const DistributedTrainerFuthark = struct {
     knowledge_fnds_tree_id: ?[32]u8,
     knowledge_fnds_index_id: ?[]u8,
     knowledge_graph_nonce: [32]u8,
-    target_source: ?accel.EmbeddingAccelerator,
+    target_source: ?accel.FrozenEmbeddingAccelerator,
     shuffle_control_state: u64,
     shuffle_mutex: std.Thread.Mutex,
     relational_fast_mode: bool,
@@ -651,23 +665,72 @@ pub const DistributedTrainerFuthark = struct {
 
         const actual_model_dim = model_dim;
 
+        if (config.memory_preflight_enabled) {
+            const preflight_started = std.time.nanoTimestamp();
+            const estimate = gpu_memory_model.estimate(.{
+                .rsf = .{ .layout = .{ .model_dim = actual_model_dim, .num_layers = num_layers }, .legacy_layer_mirrors = !config.stack_only_rsf, .spectral_startup = config.spectral_startup_iterations > 0 },
+                .embedding = .{ .layout = .{ .vocab_size = components.tokenizer.next_token_id, .model_dim = actual_model_dim }, .frozen_target_fp16 = config.target_source_frozen, .frozen_target_fp32_master = false },
+                .batch = .{ .layout = .{ .batch_size = local_batch_size, .max_seq_len = config.default_max_seq_len, .model_dim = actual_model_dim } },
+                .graph = .{ .enabled = true, .chunk_hashes = config.graph_chunk_size },
+                .nccl_world_size = coordinator.world_size,
+            }) catch |err| switch (err) {
+                error.ElementCountOverflow, error.ByteCountOverflow => return TrainerError.ValueOverflow,
+                error.InvalidDimensions => return TrainerError.InvalidModelDim,
+            };
+            const peak = estimate.peakBytes() catch return TrainerError.ValueOverflow;
+            var free_bytes: u64 = std.math.maxInt(u64);
+            var total_bytes: u64 = std.math.maxInt(u64);
+            if (accel.gpu_enabled) {
+                const memory_info = cuda_bindings.queryMemoryInfo() catch |err| {
+                    std.debug.print("[Rank {d}] memory preflight failed to query device memory: {}\n", .{ coordinator.rank, err });
+                    return TrainerError.MemoryPreflightRejected;
+                };
+                free_bytes = memory_info.free_bytes;
+                total_bytes = memory_info.total_bytes;
+            }
+            const reserve = gpu_memory_model.MemoryReserve{ .absolute_mib = config.memory_reserve_mib, .fraction = config.memory_reserve_fraction };
+            const decision = gpu_memory_model.checkAdmission(peak, free_bytes, total_bytes, reserve) catch return TrainerError.ValueOverflow;
+            const report = gpu_memory_model.formatEstimateReport(allocator, &estimate, free_bytes, total_bytes) catch return TrainerError.AllocationFailed;
+            defer allocator.free(report);
+            std.debug.print("[Rank {d}] memory preflight phase_ms={d} stack_only_rsf={any}\n{s}", .{ coordinator.rank, @divTrunc(std.time.nanoTimestamp() - preflight_started, std.time.ns_per_ms), config.stack_only_rsf, report });
+            if (!decision.admitted) {
+                const rejection = gpu_memory_model.formatRejection(allocator, decision, &estimate) catch return TrainerError.AllocationFailed;
+                defer allocator.free(rejection);
+                std.debug.print("[Rank {d}] {s}", .{ coordinator.rank, rejection });
+                return TrainerError.MemoryPreflightRejected;
+            }
+        }
+
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
-        accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
-            actual_model_dim,
-            num_layers,
-            allocator,
-            config.spectral_depth_compensation,
-        );
+        accelerator_ptr.* = try (if (config.stack_only_rsf)
+            RSFAccelerator.initStackOnly(
+                actual_model_dim,
+                num_layers,
+                allocator,
+                config.spectral_depth_compensation,
+            )
+        else
+            RSFAccelerator.initMultiLayerWithDepthScale(
+                actual_model_dim,
+                num_layers,
+                allocator,
+                config.spectral_depth_compensation,
+            ));
         var accelerator_committed = false;
         errdefer if (!accelerator_committed) accelerator_ptr.deinit();
         try accelerator_ptr.setClipRange(
             try checkedF32ToF16(config.clip_min),
             try checkedF32ToF16(config.clip_max),
         );
-        if (config.spectral_iterations > 0) {
-            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.spectral_iterations);
+        if (accelerator_ptr.ownership_mode == .stack_only) {
+            std.debug.print("[Rank {d}] rsf ownership mode=stack_only per_layer_mirror_device_allocations={d}\n", .{ coordinator.rank, accelerator_ptr.mirror_device_allocations });
+        } else {
+            std.debug.print("[Rank {d}] rsf ownership mode=mirrored per_layer_mirror_device_allocations={d}\n", .{ coordinator.rank, accelerator_ptr.mirror_device_allocations });
+        }
+        if (config.spectral_startup_iterations > 0) {
+            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.spectral_startup_iterations);
         }
 
         var gpu_embedding = try accel.EmbeddingAccelerator.init(
@@ -680,13 +743,20 @@ pub const DistributedTrainerFuthark = struct {
         var gpu_embedding_committed = false;
         errdefer if (!gpu_embedding_committed) gpu_embedding.deinit();
 
-        var target_source: ?accel.EmbeddingAccelerator = null;
+        var target_source: ?accel.FrozenEmbeddingAccelerator = null;
         var target_source_committed = false;
         errdefer if (!target_source_committed) {
             if (target_source) |*source| source.deinit();
         };
         if (config.target_source_frozen) {
-            target_source = try gpu_embedding.cloneDevice();
+            const frozen_weights = try gpu_embedding.weight.valuesFlat(&accelerator_ptr.ctx, allocator);
+            defer allocator.free(frozen_weights);
+            target_source = try accel.FrozenEmbeddingAccelerator.initFromWeightF16(
+                &accelerator_ptr.ctx,
+                gpu_embedding.vocab_size,
+                gpu_embedding.dim,
+                frozen_weights,
+            );
         }
 
         const crev_kernel_ptr = try allocator.create(ChaosCoreKernel);
@@ -727,7 +797,7 @@ pub const DistributedTrainerFuthark = struct {
         errdefer if (!fnds_manager_committed) fnds_manager_inst.deinit();
 
         const spectral_normalizer = sfd.SpectralNormalizer.initWithConfig(.{
-            .power_iterations = config.spectral_iterations,
+            .power_iterations = config.spectral_periodic_iterations,
             .max_singular_value = config.spectral_target_norm,
         });
         var knowledge_graph_nonce: [32]u8 = undefined;
@@ -831,6 +901,13 @@ pub const DistributedTrainerFuthark = struct {
             @intFromBool(self.config.shuffle_target_control),
             @intFromBool(self.config.target_source_frozen),
             @intFromBool(self.config.spectral_depth_compensation),
+            @intFromBool(self.config.stack_only_rsf),
+            @intFromBool(self.config.memory_preflight_enabled),
+            self.config.memory_reserve_mib,
+            @as(u64, @bitCast(self.config.memory_reserve_fraction)),
+            self.config.graph_chunk_size,
+            self.config.spectral_startup_iterations,
+            self.config.spectral_periodic_iterations,
             @as(u32, @bitCast(self.config.logdet_weight)),
             @as(u32, @bitCast(self.config.fisher_gamma)),
             @as(u32, @bitCast(self.config.fisher_epsilon)),
@@ -1580,7 +1657,7 @@ pub const DistributedTrainerFuthark = struct {
             var inputs = try embedding.forwardPadded(prepared.flat_input_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
             errdefer inputs.free(context);
             const targets = if (self.target_source) |*frozen_source|
-                try frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length)
+                try frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length, self.allocator)
             else
                 try embedding.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
             break :embedding_block BatchTensors{ .inputs = inputs, .targets = targets };
@@ -1720,7 +1797,7 @@ pub const DistributedTrainerFuthark = struct {
 
         var apply_spectral = false;
         if (self.gpu_embedding) |emb| {
-            if (self.config.spectral_iterations > 0) {
+            if (self.config.spectral_periodic_iterations > 0 or self.config.spectral_full_recalibration) {
                 const embedding_size = std.math.mul(usize, emb.vocab_size, emb.dim) catch return TrainerError.ValueOverflow;
                 _ = embedding_size;
                 if (completed_step % self.config.spectral_interval == 0) apply_spectral = true;
@@ -2080,7 +2157,7 @@ pub const DistributedTrainerFuthark = struct {
             const context = &self.accelerator.ctx;
             context.mutex.lock();
             defer context.mutex.unlock();
-            target_master_weights = try target.master_weight.valuesFlat(target.ctx, self.allocator);
+            target_master_weights = try target.exportMasterWeightsTemporary(self.allocator);
         }
 
         var training_graph_buffer = std.ArrayList(u8).init(self.allocator);
@@ -2498,12 +2575,20 @@ pub const DistributedTrainerFuthark = struct {
         var new_accelerator_ptr = try self.allocator.create(RSFAccelerator);
         var new_accelerator_ptr_committed = false;
         errdefer if (!new_accelerator_ptr_committed) self.allocator.destroy(new_accelerator_ptr);
-        new_accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
-            self.model_dim,
-            self.num_layers,
-            self.allocator,
-            self.config.spectral_depth_compensation,
-        );
+        new_accelerator_ptr.* = try (if (self.config.stack_only_rsf)
+            RSFAccelerator.initStackOnly(
+                self.model_dim,
+                self.num_layers,
+                self.allocator,
+                self.config.spectral_depth_compensation,
+            )
+        else
+            RSFAccelerator.initMultiLayerWithDepthScale(
+                self.model_dim,
+                self.num_layers,
+                self.allocator,
+                self.config.spectral_depth_compensation,
+            ));
         var new_accelerator_committed = false;
         errdefer if (!new_accelerator_committed) new_accelerator_ptr.deinit();
 
@@ -2540,15 +2625,14 @@ pub const DistributedTrainerFuthark = struct {
             );
         }
 
-        var loaded_target_source: ?accel.EmbeddingAccelerator = null;
+        var loaded_target_source: ?accel.FrozenEmbeddingAccelerator = null;
         var loaded_target_source_committed = false;
         errdefer if (!loaded_target_source_committed) {
             if (loaded_target_source) |*source| source.deinit();
         };
         if (pending_target_master) |master| {
-            loaded_target_source = try accel.EmbeddingAccelerator.initWithMasterWeights(
+            loaded_target_source = try accel.FrozenEmbeddingAccelerator.initFromMasterWeightsF32(
                 &new_accelerator_ptr.ctx,
-                self.allocator,
                 pending_target_vocab,
                 pending_target_dim,
                 master,

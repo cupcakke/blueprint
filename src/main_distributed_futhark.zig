@@ -1201,8 +1201,27 @@ pub fn main() !void {
     const grad_mean = (try parseOptionalEnvironmentBool(allocator, "JAIDE_GRAD_MEAN")) orelse true;
     const use_normalized_gradient_flow = (try parseOptionalEnvironmentBool(allocator, "JAIDE_NORMALIZED_GRADIENT_FLOW")) orelse true;
     const spectral_target_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SPECTRAL_NORM_TARGET")) orelse 0.9;
-    const spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_POWER_ITERATIONS")) orelse 30;
+    const spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_POWER_ITERATIONS")) orelse 1;
+    const spectral_startup_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_STARTUP_ITERATIONS")) orelse 0;
     const spectral_interval = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_INTERVAL")) orelse 10;
+    const stack_only_rsf_enabled = blk: {
+        const raw = std.posix.getenv("JAIDE_STACK_ONLY_RSF") orelse break :blk true;
+        break :blk !(std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off"));
+    };
+    const memory_preflight_enabled = blk: {
+        const raw = std.posix.getenv("JAIDE_MEMORY_PREFLIGHT") orelse break :blk true;
+        break :blk !(std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off"));
+    };
+    const memory_reserve_mib = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_MEMORY_RESERVE_MIB")) orelse 4096;
+    const graph_chunk_size = accel_interface.graphChunkSizeFromEnvironment() catch |err| {
+        std.debug.print("[Rank {d}] invalid JAIDE_GRAPH_CHUNK_SIZE: {}\n", .{ rank, err });
+        return err;
+    };
+    const skip_knowledge_graph = accel_interface.knowledgeGraphSkippedByEnvironment();
+    std.debug.print(
+        "[Rank {d}] memory configuration: stack_only_rsf={any} preflight={any} reserve_mib={d} graph_chunk_size={d} skip_knowledge_graph={any} spectral_startup_iterations={d}\n",
+        .{ rank, stack_only_rsf_enabled, memory_preflight_enabled, memory_reserve_mib, graph_chunk_size, skip_knowledge_graph, spectral_startup_iterations },
+    );
     const trust_ratio = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_TRUST_RATIO")) orelse 0.1;
     const weight_floor = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_WEIGHT_FLOOR")) orelse 1e-3;
     const gradient_clip_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_GRADIENT_CLIP_NORM")) orelse 1.0;
@@ -1411,6 +1430,12 @@ pub fn main() !void {
         trainer_config.learning_rate = learning_rate;
         trainer_config.embedding_seed = embedding_seed;
         trainer_config.spectral_iterations = spectral_iterations;
+        trainer_config.spectral_startup_iterations = spectral_startup_iterations;
+        trainer_config.spectral_periodic_iterations = spectral_iterations;
+        trainer_config.stack_only_rsf = stack_only_rsf_enabled;
+        trainer_config.memory_preflight_enabled = memory_preflight_enabled;
+        trainer_config.memory_reserve_mib = @intCast(memory_reserve_mib);
+        trainer_config.graph_chunk_size = graph_chunk_size;
         trainer_config.spectral_target_norm = spectral_target_norm;
         trainer_config.spectral_interval = @intCast(spectral_interval);
         trainer_config.clip_min = clip_min;
@@ -1528,10 +1553,19 @@ pub fn main() !void {
 
     graph_construction: {
         if (resumed_from_checkpoint) break :graph_construction;
+        if (skip_knowledge_graph) {
+            if (coordinator.isRoot()) {
+                std.debug.print(
+                    "[Rank {d}] Knowledge graph construction skipped via JAIDE_SKIP_KNOWLEDGE_GRAPH; relational passes will operate on an empty graph\n",
+                    .{ rank },
+                );
+            }
+            break :graph_construction;
+        }
         if (coordinator.isRoot()) {
             std.debug.print(
-                "[Rank {d}] Knowledge graph construction: encoding {d} samples (GPU)...\n",
-                .{ rank, samples.len },
+                "[Rank {d}] Knowledge graph construction: encoding {d} samples (GPU) chunk_size={d}...\n",
+                .{ rank, samples.len, graph_chunk_size },
             );
         }
 
@@ -1549,6 +1583,7 @@ pub fn main() !void {
                 sample_hashes,
                 0,
                 allocator,
+                graph_chunk_size,
             ) catch |err| {
                 std.debug.print(
                     "[Rank {d}] graph-construction: batchEncodeGraph failed: {} (n={d} hashes)\n",
@@ -1615,6 +1650,11 @@ pub fn main() !void {
     if (resumed_from_checkpoint) {
         std.debug.print(
             "[Rank {d}] Knowledge graph restored from checkpoint graph_ms={d}\n",
+            .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
+        );
+    } else if (skip_knowledge_graph) {
+        std.debug.print(
+            "[Rank {d}] Knowledge graph skipped by configuration graph_ms={d}\n",
             .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
         );
     } else {

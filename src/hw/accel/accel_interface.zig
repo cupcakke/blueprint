@@ -788,7 +788,7 @@ pub const RSFAccelerator = struct {
 
         var stack_master_s = try FutharkArray3DF32.newFromFlat(&ctx, master_s_data, num_layers, half, columns);
         errdefer stack_master_s.free(&ctx);
-        logDeviceAllocation("rsf_stack_master_s", num_layers, half, columns, @sizeOf(f32), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+        logDeviceAllocation("rsf_stack_master_s", num_layers, half, columns, @sizeOf(f32), stack_count, @as(i64, @intCast(@divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms))));
         var stack_master_t = try FutharkArray3DF32.newFromFlat(&ctx, master_t_data, num_layers, half, columns);
         errdefer stack_master_t.free(&ctx);
 
@@ -800,7 +800,7 @@ pub const RSFAccelerator = struct {
         if (futhark.futhark_entry_master_weights_to_f16_3d(ctx.ctx, &forward_pointer_t, stack_master_t.arr) != 0 or forward_pointer_t == null) return AccelError.FutharkScaleWeightsFailed;
         var stack_shadow_t = FutharkArray3DF16{ .arr = forward_pointer_t, .dim0 = num_layers, .dim1 = half, .dim2 = columns };
         errdefer stack_shadow_t.free(&ctx);
-        logDeviceAllocation("rsf_stack_forward_shadows", num_layers, half, columns, @sizeOf(f16), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+        logDeviceAllocation("rsf_stack_forward_shadows", num_layers, half, columns, @sizeOf(f16), stack_count, @as(i64, @intCast(@divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms))));
 
         var momentum_s = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
         errdefer momentum_s.free(&ctx);
@@ -810,7 +810,7 @@ pub const RSFAccelerator = struct {
         errdefer fisher_s.free(&ctx);
         var fisher_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
         errdefer fisher_t.free(&ctx);
-        logDeviceAllocation("rsf_stack_optimizer_states", num_layers, half, columns, @sizeOf(f32), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+        logDeviceAllocation("rsf_stack_optimizer_states", num_layers, half, columns, @sizeOf(f32), stack_count, @as(i64, @intCast(@divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms))));
 
         const max_batch: usize = 2048;
         const scratch_lengths_buf = allocator.alloc(i64, max_batch) catch return AccelError.AllocationFailed;
