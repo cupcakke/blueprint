@@ -118,6 +118,51 @@ pub fn build(b: *std.Build) void {
         distributed_futhark_exe.root_module.addImport("core_relational", core_relational_mod);
         distributed_futhark_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
 
+        const gpu_accel_test = b.addTest(.{
+            .root_source_file = b.path("src/test_root_accel_gpu.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_accel_test.linkLibC();
+        gpu_accel_test.addCSourceFile(.{
+            .file = futhark_gpu_c,
+            .flags = &.{"-O2"},
+        });
+        gpu_accel_test.addCSourceFile(.{
+            .file = b.path("src/hw/accel/futhark_abi_check.c"),
+            .flags = &.{ "-O2", "-std=c11" },
+        });
+        gpu_accel_test.addIncludePath(futhark_include);
+        gpu_accel_test.addIncludePath(.{
+            .cwd_relative = "/usr/local/cuda/include",
+        });
+        gpu_accel_test.addLibraryPath(.{
+            .cwd_relative = "/usr/local/cuda/lib64",
+        });
+        gpu_accel_test.addLibraryPath(.{
+            .cwd_relative = "/usr/local/cuda/lib64/stubs",
+        });
+        gpu_accel_test.linkSystemLibrary("cuda");
+        gpu_accel_test.linkSystemLibrary("cudart");
+        gpu_accel_test.linkSystemLibrary("nvrtc");
+        gpu_accel_test.linkSystemLibrary("cublas");
+        gpu_accel_test.linkSystemLibrary("cublasLt");
+        gpu_accel_test.linkSystemLibrary("nccl");
+        gpu_accel_test.linkSystemLibrary("m");
+        gpu_accel_test.linkSystemLibrary("pthread");
+        gpu_accel_test.linkSystemLibrary("dl");
+        gpu_accel_test.root_module.addOptions("build_options", gpu_build_options);
+        gpu_accel_test.root_module.addImport("core_relational", core_relational_mod);
+        gpu_accel_test.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+
+        if (!skip_futhark) {
+            gpu_accel_test.step.dependOn(&futhark_gpu_step.step);
+        }
+
+        const gpu_accel_test_run = b.addRunArtifact(gpu_accel_test);
+        const gpu_accel_test_step = b.step("test-gpu-accel", "Run GPU-only accelerator tests (requires CUDA build)");
+        gpu_accel_test_step.dependOn(&gpu_accel_test_run.step);
+
         if (!skip_futhark) {
             distributed_futhark_exe.step.dependOn(&futhark_gpu_step.step);
         }
@@ -139,6 +184,11 @@ pub fn build(b: *std.Build) void {
 
     const test_specs = [_]TestSpec{
         .{ .step = "test-tensor", .wrapper = "src/test_root_tensor.zig", .desc = "Run tensor tests" },
+        .{ .step = "test-gpu-memory-model", .wrapper = "src/test_root_gpu_memory_model.zig", .desc = "Run GPU memory estimator and preflight tests" },
+        .{ .step = "test-active-rows", .wrapper = "src/test_root_active_rows.zig", .desc = "Run compact active-row construction and reference equivalence tests" },
+        .{ .step = "test-phase-heartbeat", .wrapper = "src/test_root_phase_heartbeat.zig", .desc = "Run startup phase heartbeat tests" },
+        .{ .step = "test-spectral-state", .wrapper = "src/test_root_spectral_state.zig", .desc = "Run persistent spectral state tests" },
+        .{ .step = "test-rsf-backend", .wrapper = "src/test_root_rsf_backend.zig", .desc = "Run RSF backend selector tests" },
         .{ .step = "test-memory", .wrapper = "src/test_root_memory.zig", .desc = "Run memory tests" },
         .{ .step = "test-sfd", .wrapper = "src/test_root_sfd.zig", .desc = "Run SFD optimizer tests" },
         .{ .step = "test-embedding", .wrapper = "src/test_root_embedding.zig", .desc = "Run embedding tests" },

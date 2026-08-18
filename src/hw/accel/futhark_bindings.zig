@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const _build_gpu_enabled: bool = blk: {
     const opts = @import("build_options");
     if (@hasDecl(opts, "gpu_acceleration")) break :blk opts.gpu_acceleration;
@@ -32,18 +34,54 @@ pub extern "c" fn futhark_context_config_set_default_group_size(cfg: ?*struct_fu
 pub extern "c" fn futhark_context_config_set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void;
 pub extern "c" fn futhark_context_config_set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
 pub extern "c" fn futhark_context_config_set_cache_file(cfg: ?*struct_futhark_context_config, path: [*:0]const u8) void;
+pub extern "c" fn futhark_context_config_set_unified_memory(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_debugging(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_logging(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_profiling(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_add_nvrtc_option(cfg: ?*struct_futhark_context_config, opt: [*:0]const u8) void;
+
+pub const ContextSettings = struct {
+    unified_memory_enabled: bool = false,
+    logging_enabled: bool = false,
+    debugging_enabled: bool = false,
+    profiling_enabled: bool = false,
+    cache_file: ?[]const u8 = null,
+    default_group_size: c_int = gpu_default_group_size,
+    default_num_groups: c_int = gpu_default_num_groups,
+    default_tile_size: c_int = gpu_default_tile_size,
+};
+
+fn envFlag(name: []const u8) bool {
+    const value = std.posix.getenv(name) orelse return false;
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "on");
+}
+
+pub fn resolveContextSettings(cache_file: ?[*:0]const u8) ContextSettings {
+    var settings = ContextSettings{};
+    if (cache_file) |path| settings.cache_file = std.mem.span(path);
+    settings.unified_memory_enabled = envFlag("JAIDE_FUTHARK_UNIFIED_MEMORY");
+    settings.logging_enabled = envFlag("JAIDE_FUTHARK_LOG");
+    settings.debugging_enabled = envFlag("JAIDE_FUTHARK_DEBUG");
+    settings.profiling_enabled = envFlag("JAIDE_FUTHARK_PROFILE");
+    return settings;
+}
 
 pub fn configureGpuContext(
     cfg: ?*struct_futhark_context_config,
     cache_file: ?[*:0]const u8,
-) GpuConfigurationError!void {
+) GpuConfigurationError!ContextSettings {
     if (comptime _build_gpu_enabled) {
+        const settings = resolveContextSettings(cache_file);
         futhark_context_config_set_device(cfg, "");
-        futhark_context_config_set_default_group_size(cfg, gpu_default_group_size);
-        futhark_context_config_set_default_num_groups(cfg, gpu_default_num_groups);
-        futhark_context_config_set_default_tile_size(cfg, gpu_default_tile_size);
+        futhark_context_config_set_default_group_size(cfg, settings.default_group_size);
+        futhark_context_config_set_default_num_groups(cfg, settings.default_num_groups);
+        futhark_context_config_set_default_tile_size(cfg, settings.default_tile_size);
+        futhark_context_config_set_unified_memory(cfg, if (settings.unified_memory_enabled) 1 else 0);
+        futhark_context_config_set_logging(cfg, if (settings.logging_enabled) 1 else 0);
+        futhark_context_config_set_debugging(cfg, if (settings.debugging_enabled) 1 else 0);
+        futhark_context_config_set_profiling(cfg, if (settings.profiling_enabled) 1 else 0);
         if (cache_file) |path| futhark_context_config_set_cache_file(cfg, path);
-        return;
+        return settings;
     }
     return error.GpuAccelerationDisabled;
 }

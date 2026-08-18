@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const cudaError_t = c_uint;
 pub const cudaSuccess: cudaError_t = 0;
 pub const cudaErrorInvalidValue: cudaError_t = 1;
@@ -10,6 +12,37 @@ pub const cudaErrorInvalidDeviceFunction: cudaError_t = 8;
 pub const cudaErrorInvalidConfiguration: cudaError_t = 9;
 pub const cudaErrorInvalidDevice: cudaError_t = 10;
 pub const cudaErrorInvalidMemcpyDirection: cudaError_t = 21;
+pub const cudaErrorOutOfMemory: cudaError_t = 2;
+pub const cudaErrorUnknown: cudaError_t = 999;
+
+pub const cudaDevAttrComputeCapabilityMajor: c_int = 75;
+pub const cudaDevAttrComputeCapabilityMinor: c_int = 76;
+pub const cudaDevAttrMaxThreadsPerBlock: c_int = 1;
+pub const cudaDevAttrMultiProcessorCount: c_int = 16;
+pub const cudaDevAttrTotalConstantMemory: c_int = 11;
+pub const cudaDevAttrL2CacheSize: c_int = 38;
+pub const cudaDevAttrMaxSharedMemoryPerBlockOptin: c_int = 97;
+
+pub const DeviceMemoryInfo = struct {
+    free_bytes: usize,
+    total_bytes: usize,
+};
+
+pub const DeviceIdentity = struct {
+    compute_capability_major: c_int = 0,
+    compute_capability_minor: c_int = 0,
+    multiprocessor_count: c_int = 0,
+    max_threads_per_block: c_int = 0,
+    l2_cache_bytes: c_int = 0,
+};
+
+pub const AllocationFailure = struct {
+    requested_bytes: usize,
+    free_bytes: usize,
+    total_bytes: usize,
+    estimated_peak_bytes: usize,
+    reserve_bytes: usize,
+};
 
 pub const cudaHostAllocDefault: c_uint = 0;
 pub const cudaHostAllocPortable: c_uint = 1;
@@ -85,6 +118,8 @@ const RealApi = struct {
     pub extern "c" fn cudaGetDeviceCount(count: *c_int) cudaError_t;
     pub extern "c" fn cudaSetDevice(device: c_int) cudaError_t;
     pub extern "c" fn cudaGetDevice(device: *c_int) cudaError_t;
+    pub extern "c" fn cudaMemGetInfo(free: *usize, total: *usize) cudaError_t;
+    pub extern "c" fn cudaDeviceGetAttribute(value: *c_int, attr: c_int, device: c_int) cudaError_t;
 
     pub extern "c" fn cublasCreate_v2(handle: *cublasHandle_t) cublasStatus_t;
     pub extern "c" fn cublasDestroy_v2(handle: cublasHandle_t) cublasStatus_t;
@@ -167,6 +202,55 @@ pub const cudaStreamDestroy = RealApi.cudaStreamDestroy;
 pub const cudaGetDeviceCount = RealApi.cudaGetDeviceCount;
 pub const cudaSetDevice = RealApi.cudaSetDevice;
 pub const cudaGetDevice = RealApi.cudaGetDevice;
+pub const cudaMemGetInfo = RealApi.cudaMemGetInfo;
+pub const cudaDeviceGetAttribute = RealApi.cudaDeviceGetAttribute;
+
+pub fn queryMemoryInfo() CudaError!DeviceMemoryInfo {
+    var free_bytes: usize = 0;
+    var total_bytes: usize = 0;
+    const err = RealApi.cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (err != cudaSuccess) return classifyCudaError(err);
+    return DeviceMemoryInfo{ .free_bytes = free_bytes, .total_bytes = total_bytes };
+}
+
+pub fn queryDeviceIdentity(device: c_int) CudaError!DeviceIdentity {
+    var identity = DeviceIdentity{};
+    const attrs = [_]struct { attr: c_int, field: []const u8 }{
+        .{ .attr = cudaDevAttrComputeCapabilityMajor, .field = "compute_capability_major" },
+        .{ .attr = cudaDevAttrComputeCapabilityMinor, .field = "compute_capability_minor" },
+        .{ .attr = cudaDevAttrMultiProcessorCount, .field = "multiprocessor_count" },
+        .{ .attr = cudaDevAttrMaxThreadsPerBlock, .field = "max_threads_per_block" },
+        .{ .attr = cudaDevAttrL2CacheSize, .field = "l2_cache_bytes" },
+    };
+    inline for (attrs) |entry| {
+        var value: c_int = 0;
+        const err = RealApi.cudaDeviceGetAttribute(&value, entry.attr, device);
+        if (err != cudaSuccess) return classifyCudaError(err);
+        if (comptime std.mem.eql(u8, entry.field, "compute_capability_major")) identity.compute_capability_major = value;
+        if (comptime std.mem.eql(u8, entry.field, "compute_capability_minor")) identity.compute_capability_minor = value;
+        if (comptime std.mem.eql(u8, entry.field, "multiprocessor_count")) identity.multiprocessor_count = value;
+        if (comptime std.mem.eql(u8, entry.field, "max_threads_per_block")) identity.max_threads_per_block = value;
+        if (comptime std.mem.eql(u8, entry.field, "l2_cache_bytes")) identity.l2_cache_bytes = value;
+    }
+    return identity;
+}
+
+pub fn classifyCudaError(err: cudaError_t) CudaError {
+    return switch (err) {
+        cudaSuccess => unreachable,
+        cudaErrorInvalidValue => CudaError.InvalidValue,
+        cudaErrorMemoryAllocation => CudaError.MemoryAllocation,
+        cudaErrorInitializationError => CudaError.InitializationError,
+        cudaErrorLaunchFailure => CudaError.LaunchFailure,
+        cudaErrorLaunchTimeout => CudaError.LaunchTimeout,
+        cudaErrorLaunchOutOfResources => CudaError.LaunchOutOfResources,
+        cudaErrorInvalidDeviceFunction => CudaError.InvalidDeviceFunction,
+        cudaErrorInvalidConfiguration => CudaError.InvalidConfiguration,
+        cudaErrorInvalidDevice => CudaError.InvalidDevice,
+        cudaErrorInvalidMemcpyDirection => CudaError.InvalidMemcpyDirection,
+        else => CudaError.Unknown,
+    };
+}
 pub const cublasCreate_v2 = RealApi.cublasCreate_v2;
 pub const cublasDestroy_v2 = RealApi.cublasDestroy_v2;
 pub const cublasSetStream_v2 = RealApi.cublasSetStream_v2;
@@ -181,7 +265,7 @@ pub const cublasSdot_v2 = RealApi.cublasSdot_v2;
 pub const cublasSaxpy_v2 = RealApi.cublasSaxpy_v2;
 
 pub fn checkCuda(err: cudaError_t) CudaError!void {
-    if (err != cudaSuccess) return CudaError.Unknown;
+    if (err != cudaSuccess) return classifyCudaError(err);
 }
 
 pub fn checkCublas(err: cublasStatus_t) CudaError!void {
