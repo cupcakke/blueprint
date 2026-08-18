@@ -228,3 +228,129 @@ test "estimator matches stack-only trainer configuration" {
     try std.testing.expect(estimate.frozen_target_fp16_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), estimate.frozen_target_fp32_master_bytes);
 }
+
+test "compact embedding forward equals padded forward sliced to active rows" {
+    const allocator = std.heap.page_allocator;
+    var context = try accel.FutharkContext.init();
+    defer context.deinit();
+
+    const vocab: usize = 53;
+    const dim: usize = 32;
+    const total = vocab * dim;
+    const host_weights = try allocator.alloc(f16, total);
+    defer allocator.free(host_weights);
+    var rng = std.Random.DefaultPrng.init(0xC0714C7);
+    for (host_weights) |*value| {
+        value.* = @floatCast((rng.random().float(f32) - 0.5) * 0.02);
+    }
+
+    var embedding = try accel.EmbeddingAccelerator.initWithWeights(&context, allocator, vocab, dim, host_weights);
+    defer embedding.deinit();
+
+    const lengths = [_]usize{ 3, 0, 5, 2 };
+    const padded: usize = 5;
+    var flat_tokens: [20]u32 = undefined;
+    for (0..20) |index| {
+        flat_tokens[index] = @intCast(index % vocab);
+    }
+
+    var padded_out = try embedding.forwardPadded(&flat_tokens, &lengths, padded);
+    defer padded_out.free(&context);
+
+    const compact_tokens = [_]u32{ flat_tokens[0], flat_tokens[1], flat_tokens[2], flat_tokens[10], flat_tokens[11], flat_tokens[12], flat_tokens[13], flat_tokens[14], flat_tokens[15], flat_tokens[16] };
+    var compact_out = try embedding.forwardCompact(&compact_tokens, allocator);
+    defer compact_out.free(&context);
+    try context.sync();
+
+    try std.testing.expectEqual(@as(usize, 10), compact_out.dim0);
+    try std.testing.expectEqual(@as(usize, 1), compact_out.dim1);
+
+    const padded_flat = try padded_out.valuesFlat(&context, allocator);
+    defer allocator.free(padded_flat);
+    const compact_flat = try compact_out.valuesFlat(&context, allocator);
+    defer allocator.free(compact_flat);
+
+    const expected_rows = [_]usize{ 0, 1, 2, 10, 11, 12, 13, 14, 15, 16 };
+    for (expected_rows, 0..) |padded_row, compact_row| {
+        for (0..dim) |c| {
+            try std.testing.expectEqual(padded_flat[padded_row * dim + c], compact_flat[compact_row * dim + c]);
+        }
+    }
+}
+
+test "compact fused training step matches padded fused training step" {
+    const allocator = std.heap.page_allocator;
+    var accelerator = try accel.RSFAccelerator.initStackOnly(32, 2, allocator, true);
+    defer accelerator.deinit();
+
+    const batch: usize = 3;
+    const seq: usize = 5;
+    const dim: usize = 32;
+    const lengths = [_]usize{ 3, 0, 5 };
+    const active: usize = 3 + 0 + 5;
+
+    const padded_total = batch * seq * dim;
+    const host_inputs = try allocator.alloc(f16, padded_total);
+    defer allocator.free(host_inputs);
+    const host_targets = try allocator.alloc(f16, padded_total);
+    defer allocator.free(host_targets);
+    var rng = std.Random.DefaultPrng.init(0xABCDEF);
+    for (0..batch * seq) |row| {
+        for (0..dim) |c| {
+            const index = row * dim + c;
+            host_inputs[index] = @floatCast((rng.random().float(f32) - 0.5) * 0.3);
+            host_targets[index] = @floatCast((rng.random().float(f32) - 0.5) * 0.3);
+        }
+    }
+
+    var inputs_padded = try accel.FutharkArray3DF16.newFromFlat(&accelerator.ctx, host_inputs, batch, seq, dim);
+    defer inputs_padded.free(&accelerator.ctx);
+    var targets_padded = try accel.FutharkArray3DF16.newFromFlat(&accelerator.ctx, host_targets, batch, seq, dim);
+    defer targets_padded.free(&accelerator.ctx);
+
+    var padded_result = try accelerator.fusedTrainingStep(&inputs_padded, &targets_padded, &lengths, true, 1.0, 0.3, 1.0, -1e-3);
+    defer padded_result.deinit(&accelerator.ctx);
+
+    const compact_inputs = try allocator.alloc(f16, active * dim);
+    defer allocator.free(compact_inputs);
+    const compact_targets = try allocator.alloc(f16, active * dim);
+    defer allocator.free(compact_targets);
+    const active_rows_list = [_]usize{ 0, 1, 2, 10, 11, 12, 13, 14 };
+    for (active_rows_list, 0..) |padded_row, compact_row| {
+        @memcpy(compact_inputs[compact_row * dim .. (compact_row + 1) * dim], host_inputs[padded_row * dim .. (padded_row + 1) * dim]);
+        @memcpy(compact_targets[compact_row * dim .. (compact_row + 1) * dim], host_targets[padded_row * dim .. (padded_row + 1) * dim]);
+    }
+
+    var inputs_compact = try accel.FutharkArray3DF16.newFromFlat(&accelerator.ctx, compact_inputs, active, 1, dim);
+    defer inputs_compact.free(&accelerator.ctx);
+    var targets_compact = try accel.FutharkArray3DF16.newFromFlat(&accelerator.ctx, compact_targets, active, 1, dim);
+    defer targets_compact.free(&accelerator.ctx);
+    const ones = try allocator.alloc(usize, active);
+    defer allocator.free(ones);
+    @memset(ones, 1);
+
+    var compact_result = try accelerator.fusedTrainingStep(&inputs_compact, &targets_compact, ones, true, 1.0, 0.3, 1.0, -1e-3);
+    defer compact_result.deinit(&accelerator.ctx);
+
+    const padded_scalars = try padded_result.finalize(&accelerator.ctx);
+    const compact_scalars = try compact_result.finalize(&accelerator.ctx);
+    try std.testing.expectApproxEqAbs(padded_scalars.loss, compact_scalars.loss, 1e-4);
+    try std.testing.expectApproxEqAbs(padded_scalars.reconstruction_loss, compact_scalars.reconstruction_loss, 1e-4);
+    try std.testing.expectApproxEqAbs(padded_scalars.logdet_mean, compact_scalars.logdet_mean, 1e-4);
+
+    const padded_grad_s = try padded_result.stack_gradient_s.valuesFlat(&accelerator.ctx, allocator);
+    defer allocator.free(padded_grad_s);
+    const compact_grad_s = try compact_result.stack_gradient_s.valuesFlat(&accelerator.ctx, allocator);
+    defer allocator.free(compact_grad_s);
+    try std.testing.expectEqual(padded_grad_s.len, compact_grad_s.len);
+    for (padded_grad_s, compact_grad_s) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+    const padded_grad_t = try padded_result.stack_gradient_t.valuesFlat(&accelerator.ctx, allocator);
+    defer allocator.free(padded_grad_t);
+    const compact_grad_t = try compact_result.stack_gradient_t.valuesFlat(&accelerator.ctx, allocator);
+    defer allocator.free(compact_grad_t);
+    for (padded_grad_t, compact_grad_t) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+}

@@ -10,6 +10,7 @@ const nccl = @import("distributed/nccl_bindings.zig");
 const modal_gpu = @import("distributed/modal_gpu.zig");
 const core_relational = @import("core_relational/mod.zig");
 const accel_interface = @import("hw/accel/accel_interface.zig");
+const phase_heartbeat = @import("distributed/phase_heartbeat.zig");
 const core_memory = @import("core/memory.zig");
 
 fn extractDatasetText(
@@ -1208,6 +1209,19 @@ pub fn main() !void {
         const raw = std.posix.getenv("JAIDE_STACK_ONLY_RSF") orelse break :blk true;
         break :blk !(std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off"));
     };
+    const compact_rows_enabled = blk: {
+        const raw = std.posix.getenv("JAIDE_COMPACT_ROWS") orelse break :blk true;
+        break :blk !(std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off"));
+    };
+    const heartbeat_interval_sec = blk: {
+        const raw = std.posix.getenv("JAIDE_HEARTBEAT_SEC") orelse break :blk @as(u64, 30);
+        break :blk std.fmt.parseInt(u64, raw, 10) catch @as(u64, 30);
+    };
+    const heartbeat = phase_heartbeat.PhaseHeartbeat.start(allocator, .{ .interval_sec = heartbeat_interval_sec, .rank = rank }) catch |err| {
+        std.debug.print("[Rank {d}] heartbeat start failed: {}\n", .{ rank, err });
+        return err;
+    };
+    defer heartbeat.stop();
     const memory_preflight_enabled = blk: {
         const raw = std.posix.getenv("JAIDE_MEMORY_PREFLIGHT") orelse break :blk true;
         break :blk !(std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off"));
@@ -1219,8 +1233,8 @@ pub fn main() !void {
     };
     const skip_knowledge_graph = accel_interface.knowledgeGraphSkippedByEnvironment();
     std.debug.print(
-        "[Rank {d}] memory configuration: stack_only_rsf={any} preflight={any} reserve_mib={d} graph_chunk_size={d} skip_knowledge_graph={any} spectral_startup_iterations={d}\n",
-        .{ rank, stack_only_rsf_enabled, memory_preflight_enabled, memory_reserve_mib, graph_chunk_size, skip_knowledge_graph, spectral_startup_iterations },
+        "[Rank {d}] memory configuration: stack_only_rsf={any} preflight={any} reserve_mib={d} graph_chunk_size={d} skip_knowledge_graph={any} spectral_startup_iterations={d} compact_rows={any} heartbeat_sec={d}\n",
+        .{ rank, stack_only_rsf_enabled, memory_preflight_enabled, memory_reserve_mib, graph_chunk_size, skip_knowledge_graph, spectral_startup_iterations, compact_rows_enabled, heartbeat_interval_sec },
     );
     const trust_ratio = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_TRUST_RATIO")) orelse 0.1;
     const weight_floor = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_WEIGHT_FLOOR")) orelse 1e-3;
@@ -1247,6 +1261,7 @@ pub fn main() !void {
     );
 
     const dataset_started = std.time.nanoTimestamp();
+    heartbeat.setPhase("dataset_load");
     const samples = try loadDataset(
         allocator,
         &coordinator,
@@ -1436,6 +1451,7 @@ pub fn main() !void {
         trainer_config.memory_preflight_enabled = memory_preflight_enabled;
         trainer_config.memory_reserve_mib = @intCast(memory_reserve_mib);
         trainer_config.graph_chunk_size = graph_chunk_size;
+        trainer_config.compact_rows = compact_rows_enabled;
         trainer_config.spectral_target_norm = spectral_target_norm;
         trainer_config.spectral_interval = @intCast(spectral_interval);
         trainer_config.clip_min = clip_min;
@@ -1459,6 +1475,7 @@ pub fn main() !void {
             .tokenizer = tokenizer,
         };
 
+        heartbeat.setPhase("model_initialization");
         const model_initialization_started = std.time.nanoTimestamp();
         const initialized_trainer = try DistributedTrainerFuthark.initWithComponents(
             allocator,
@@ -1475,6 +1492,7 @@ pub fn main() !void {
     defer trainer.deinit();
     std.debug.print("[Rank {d}] model_compile_initialization_ms={d}\n", .{ rank, @divTrunc(model_initialization_elapsed, std.time.ns_per_ms) });
 
+    heartbeat.setPhase("checkpoint_restore");
     const resume_checkpoint_owned = std.process.getEnvVarOwned(allocator, "JAIDE_RESUME_CHECKPOINT") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
@@ -1548,6 +1566,7 @@ pub fn main() !void {
         );
     }
 
+    heartbeat.setPhase("knowledge_graph");
     const graph_started = std.time.nanoTimestamp();
     var graph_stage_error: ?anyerror = null;
 
@@ -1663,6 +1682,7 @@ pub fn main() !void {
             .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
         );
     }
+    heartbeat.setPhase("training");
     const startup_elapsed = std.time.nanoTimestamp() - startup_started;
     std.debug.print("[Rank {d}] startup_total_ms={d}\n", .{ rank, @divTrunc(startup_elapsed, std.time.ns_per_ms) });
 

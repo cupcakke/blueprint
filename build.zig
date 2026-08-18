@@ -185,6 +185,10 @@ pub fn build(b: *std.Build) void {
     const test_specs = [_]TestSpec{
         .{ .step = "test-tensor", .wrapper = "src/test_root_tensor.zig", .desc = "Run tensor tests" },
         .{ .step = "test-gpu-memory-model", .wrapper = "src/test_root_gpu_memory_model.zig", .desc = "Run GPU memory estimator and preflight tests" },
+        .{ .step = "test-active-rows", .wrapper = "src/test_root_active_rows.zig", .desc = "Run compact active-row construction and reference equivalence tests" },
+        .{ .step = "test-phase-heartbeat", .wrapper = "src/test_root_phase_heartbeat.zig", .desc = "Run startup phase heartbeat tests" },
+        .{ .step = "test-spectral-state", .wrapper = "src/test_root_spectral_state.zig", .desc = "Run persistent spectral state tests" },
+        .{ .step = "test-rsf-backend", .wrapper = "src/test_root_rsf_backend.zig", .desc = "Run RSF backend selector tests" },
         .{ .step = "test-memory", .wrapper = "src/test_root_memory.zig", .desc = "Run memory tests" },
         .{ .step = "test-sfd", .wrapper = "src/test_root_sfd.zig", .desc = "Run SFD optimizer tests" },
         .{ .step = "test-embedding", .wrapper = "src/test_root_embedding.zig", .desc = "Run embedding tests" },

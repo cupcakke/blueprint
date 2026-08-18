@@ -216,7 +216,7 @@ TRAINING_PHASE_MARKERS = (
     ("checkpoint_restore", ("checkpoint restore", "Checkpoint restored")),
     ("graph_construction", ("Knowledge graph construction", "graph-construction")),
     ("training_start", ("Starting Futhark-accelerated training",)),
-    ("training_step", ("[Step ",)),
+    ("training_step", ("[Step ", "active_rows=")),
 )
 
 
@@ -1372,6 +1372,7 @@ def run_gpu_train_and_infer(
         recon_curve: List[Tuple[int, float]] = []
         source_rms_curve: List[Tuple[int, float]] = []
         epoch_metrics: List[Dict[str, Any]] = []
+        active_rows_samples: List[Tuple[int, int, float]] = []
         timing_keys = (
             "dataset_ms",
             "tokenizer_ms",
@@ -1401,6 +1402,14 @@ def run_gpu_train_and_infer(
                     step_time_ms = int(line.split("step_total_ms=", 1)[1].split()[0])
                     if token_count > 0 and step_time_ms > 0:
                         throughput_samples.append((token_count, step_time_ms))
+                except (ValueError, IndexError):
+                    pass
+            if "active_rows=" in line:
+                try:
+                    active_part = line.split("active_rows=", 1)[1].split()[0]
+                    padded_part = line.split("padded_rows=", 1)[1].split()[0]
+                    ratio_part = line.split("active_ratio=", 1)[1].split()[0]
+                    active_rows_samples.append((int(active_part), int(padded_part), float(ratio_part)))
                 except (ValueError, IndexError):
                     pass
             if "[Step " in line and "Loss:" in line:
@@ -1455,6 +1464,9 @@ def run_gpu_train_and_infer(
             "loss_curve_length": len(loss_curve),
             "first_loss": loss_curve[0][1] if loss_curve else None,
             "last_loss": loss_curve[-1][1] if loss_curve else None,
+            "active_rows_samples": len(active_rows_samples),
+            "active_rows_last": {"active": active_rows_samples[-1][0], "padded": active_rows_samples[-1][1], "ratio": active_rows_samples[-1][2]} if active_rows_samples else None,
+            "padding_removed": bool(active_rows_samples and all(a < p for a, p, _ in active_rows_samples)),
             "recon_curve_length": len(recon_curve),
             "first_recon": recon_curve[0][1] if recon_curve else None,
             "last_recon": recon_curve[-1][1] if recon_curve else None,

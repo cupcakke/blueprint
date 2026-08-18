@@ -2090,6 +2090,98 @@ pub const EmbeddingAccelerator = struct {
         _ = futhark.futhark_free_f32_2d(self.ctx.ctx, old_gradient);
     }
 
+    pub fn forwardCompact(
+        self: *Self,
+        tokens: []const u32,
+        allocator: std.mem.Allocator,
+    ) AccelError!FutharkArray3DF16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (tokens.len == 0) return AccelError.InvalidDimensions;
+        const lengths = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(lengths);
+        for (lengths) |*value| value.* = 1;
+        const positions = allocator.alloc(i64, 1) catch return AccelError.AllocationFailed;
+        defer allocator.free(positions);
+        positions[0] = 0;
+
+        const token_i64s = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths);
+        defer length_array.free(self.ctx);
+        var position_array = try FutharkArray1DI64.newFromSlice(self.ctx, positions);
+        defer position_array.free(self.ctx);
+
+        var output: ?*futhark.struct_futhark_f16_3d = null;
+        const result = futhark.futhark_entry_embedding_forward_padded(
+            self.ctx.ctx,
+            &output,
+            token_array.arr,
+            length_array.arr,
+            position_array.arr,
+            self.weight.arr,
+        );
+        if (result != 0 or output == null) {
+            if (output) |value| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, value);
+            return AccelError.FutharkForwardFailed;
+        }
+        return FutharkArray3DF16{ .arr = output, .dim0 = tokens.len, .dim1 = 1, .dim2 = self.dim };
+    }
+
+    pub fn backwardCompactAccumulate(
+        self: *Self,
+        tokens: []const u32,
+        gradient_output: *FutharkArray3DF16,
+        allocator: std.mem.Allocator,
+    ) AccelError!void {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (gradient_output.arr == null or gradient_output.dim2 != self.dim) return AccelError.InvalidDimensions;
+        if (gradient_output.dim1 != 1) return AccelError.InvalidDimensions;
+        if (gradient_output.dim0 != tokens.len) return AccelError.InvalidDimensions;
+
+        const lengths = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(lengths);
+        for (lengths) |*value| value.* = 1;
+        const token_i64s = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths);
+        defer length_array.free(self.ctx);
+
+        var new_gradient: ?*futhark.struct_futhark_f32_2d = null;
+        const result = futhark.futhark_entry_embedding_backward_padded(
+            self.ctx.ctx,
+            &new_gradient,
+            token_array.arr,
+            length_array.arr,
+            gradient_output.arr,
+            self.grad_weight.arr,
+        );
+        if (result != 0 or new_gradient == null) {
+            if (new_gradient) |value| _ = futhark.futhark_free_f32_2d(self.ctx.ctx, value);
+            return AccelError.FutharkBackwardFailed;
+        }
+        const old_gradient = self.grad_weight.arr;
+        self.grad_weight.arr = new_gradient;
+        _ = futhark.futhark_free_f32_2d(self.ctx.ctx, old_gradient);
+    }
+
     pub fn getGradientDevicePtrF32(self: *Self) AccelError!DeviceBufferF32 {
         if (!self.initialized or self.grad_weight.arr == null) return AccelError.NullPointer;
         return self.grad_weight.deviceBuffer(self.ctx);
@@ -2442,6 +2534,51 @@ pub const FrozenEmbeddingAccelerator = struct {
             .dim1 = sequence_length,
             .dim2 = self.dim,
         };
+    }
+
+    pub fn forwardCompact(
+        self: *Self,
+        tokens: []const u32,
+        allocator: std.mem.Allocator,
+    ) AccelError!FutharkArray3DF16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (tokens.len == 0) return AccelError.InvalidDimensions;
+        const lengths = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(lengths);
+        for (lengths) |*value| value.* = 1;
+        const positions = allocator.alloc(i64, 1) catch return AccelError.AllocationFailed;
+        defer allocator.free(positions);
+        positions[0] = 0;
+        const token_i64s = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths);
+        defer length_array.free(self.ctx);
+        var position_array = try FutharkArray1DI64.newFromSlice(self.ctx, positions);
+        defer position_array.free(self.ctx);
+
+        var output: ?*futhark.struct_futhark_f16_3d = null;
+        const result = futhark.futhark_entry_embedding_forward_padded(
+            self.ctx.ctx,
+            &output,
+            token_array.arr,
+            length_array.arr,
+            position_array.arr,
+            self.weight.arr,
+        );
+        if (result != 0 or output == null) {
+            if (output) |value| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, value);
+            return AccelError.FutharkForwardFailed;
+        }
+        return FutharkArray3DF16{ .arr = output, .dim0 = tokens.len, .dim1 = 1, .dim2 = self.dim };
     }
 
     pub fn exportMasterWeightsTemporary(self: *Self, allocator: std.mem.Allocator) AccelError![]f32 {

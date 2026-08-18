@@ -137,6 +137,8 @@ pub const BatchActivationOptions = struct {
     fp16_padded_tensors: u64 = 5,
     fp32_padded_tensors: u64 = 1,
     index_arrays: bool = true,
+    compact_rows: bool = false,
+    active_rows_override: u64 = 0,
 };
 
 pub const MemoryEstimate = struct {
@@ -347,13 +349,17 @@ pub fn estimate(config: EstimatorConfig) EstimationError!MemoryEstimate {
     if (config.embedding.frozen_target_fp16) out.frozen_target_fp16_bytes = try checkedBytes(embedding_elements, bytes_per_f16);
     if (config.embedding.frozen_target_fp32_master) out.frozen_target_fp32_master_bytes = try checkedBytes(embedding_elements, bytes_per_f32);
 
-    const padded_bytes = try config.batch.layout.paddedBytesFp16();
-    out.batch_activation_bytes = try checkedMul(u64, padded_bytes, config.batch.fp16_padded_tensors);
-    const fp32_batch = try checkedBytes(try checkedMul(u64, padded_bytes, 2), config.batch.fp32_padded_tensors);
+    const padded_rows_total = try config.batch.layout.paddedRows();
+    const activation_rows = if (config.batch.compact_rows and config.batch.active_rows_override > 0 and config.batch.active_rows_override < padded_rows_total)
+        config.batch.active_rows_override
+    else
+        padded_rows_total;
+    const row_bytes_f16 = try checkedBytes(try checkedMul(u64, activation_rows, @intCast(config.batch.layout.model_dim)), bytes_per_f16);
+    out.batch_activation_bytes = try checkedMul(u64, row_bytes_f16, config.batch.fp16_padded_tensors);
+    const fp32_batch = try checkedBytes(try checkedMul(u64, row_bytes_f16, 2), config.batch.fp32_padded_tensors);
     out.batch_activation_bytes = try checkedAdd(u64, out.batch_activation_bytes, fp32_batch);
     if (config.batch.index_arrays) {
-        const rows = try config.batch.layout.paddedRows();
-        out.batch_index_bytes = try checkedBytes(try checkedMul(u64, rows, 2), bytes_per_i64);
+        out.batch_index_bytes = try checkedBytes(try checkedMul(u64, activation_rows, 2), bytes_per_i64);
         out.batch_index_bytes = try checkedAdd(u64, out.batch_index_bytes, try checkedBytes(@intCast(config.batch.layout.batch_size), bytes_per_i64));
     }
 
@@ -558,6 +564,23 @@ test "rejection report names largest contributors" {
     try std.testing.expect(std.mem.indexOf(u8, report, "rsf_fp32_master_stacks") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "memory preflight rejected") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "remedies") != null);
+}
+
+test "compact active-row accounting reduces activation estimate only" {
+    const padded_estimate = try estimate(.{
+        .rsf = .{ .layout = .{ .model_dim = 1024, .num_layers = 2 } },
+        .embedding = .{ .layout = .{ .vocab_size = 1000, .model_dim = 1024 } },
+        .batch = .{ .layout = .{ .batch_size = 8, .max_seq_len = 64, .model_dim = 1024 } },
+    });
+    const compact_estimate = try estimate(.{
+        .rsf = .{ .layout = .{ .model_dim = 1024, .num_layers = 2 } },
+        .embedding = .{ .layout = .{ .vocab_size = 1000, .model_dim = 1024 } },
+        .batch = .{ .layout = .{ .batch_size = 8, .max_seq_len = 64, .model_dim = 1024 }, .compact_rows = true, .active_rows_override = 8 * 16 },
+    });
+    try std.testing.expect(compact_estimate.batch_activation_bytes < padded_estimate.batch_activation_bytes);
+    try std.testing.expect(compact_estimate.batch_index_bytes < padded_estimate.batch_index_bytes);
+    try std.testing.expectEqual(padded_estimate.rsfPersistentBytes(), compact_estimate.rsfPersistentBytes());
+    try std.testing.expectEqual(padded_estimate.embeddingPersistentBytes(), compact_estimate.embeddingPersistentBytes());
 }
 
 test "persistent memory is not claimed to be o of dim" {

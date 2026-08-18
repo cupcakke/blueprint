@@ -59,6 +59,25 @@ configurable reserve, reporting the largest contributors.
   iterations (default 0, previously 30 at every startup).
 - `JAIDE_SPECTRAL_POWER_ITERATIONS` - periodic spectral normalization
   iterations (default 1).
+- `JAIDE_COMPACT_ROWS=0` - disable compact active-row execution; dense RSF
+  compute then runs over padded positions again (default enabled). Per step
+  the trainer logs `active_rows`, `padded_rows`, and `active_ratio`; loss,
+  reconstruction, log-determinant normalization and `grad_mean` divisors are
+  identical between compact and padded execution by construction.
+- `JAIDE_HEARTBEAT_SEC` - startup/phase heartbeat interval in seconds for the
+  training binary (default 30; 0 disables).
+- `JAIDE_RSF_BACKEND` - RSF execution backend selector: `futhark` (default,
+  production), `reference` (host reference math on active rows, correctness
+  testing only), `cublas` (classified as unavailable until kernels are
+  regenerated to export per-layer elementwise stages and persistent spectral
+  vectors; selection fails fast with `RsfBackendUnavailable` instead of a
+  silent fallback).
+
+Persistent spectral state: the trainable-embedding power-iteration vectors
+survive across periodic normalizations and are reset only when the matrix
+shape or weight ownership changes; the stack keeps a per-layer persistent
+spectral state bookkeeper whose iteration counter and sigma estimates are
+reported per spectral update (`persistent_iterations_total`).
 - `JAIDE_BENCH_MODEL_INIT_DEADLINE_SEC` - bench watchdog: model
   initialization deadline (default 900).
 - `JAIDE_BENCH_IDLE_OUTPUT_SEC` - bench watchdog: no-output timeout during
