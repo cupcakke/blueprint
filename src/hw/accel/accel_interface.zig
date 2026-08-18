@@ -1622,6 +1622,190 @@ pub const FutharkArray1DI64 = struct {
     }
 };
 
+pub const FrozenEmbeddingTarget = struct {
+    ctx: *FutharkContext,
+    weight: FutharkArray2DF16,
+    vocab_size: usize,
+    dim: usize,
+    initialized: bool,
+    allocator: std.mem.Allocator,
+    scratch_token_buf: []i64,
+    scratch_token_cap: usize,
+    scratch_lengths_buf: []i64,
+    scratch_lengths_cap: usize,
+    scratch_positions_buf: []i64,
+    scratch_positions_cap: usize,
+
+    const Self = @This();
+
+    const scratch_max_batch: usize = 2048;
+    const scratch_max_seq: usize = 1024;
+
+    fn allocScratch(allocator: std.mem.Allocator) AccelError!struct { tokens: []i64, lengths: []i64, positions: []i64 } {
+        const scratch_count = std.math.mul(usize, scratch_max_batch, scratch_max_seq) catch return AccelError.InvalidDimensions;
+        const tokens = allocator.alloc(i64, scratch_count) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(tokens);
+        const lengths = allocator.alloc(i64, scratch_max_batch) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(lengths);
+        const positions = allocator.alloc(i64, scratch_max_seq) catch return AccelError.AllocationFailed;
+        return .{ .tokens = tokens, .lengths = lengths, .positions = positions };
+    }
+
+    pub fn initFromShadow(
+        ctx: *FutharkContext,
+        allocator: std.mem.Allocator,
+        shadow_values: []const f16,
+        vocab_size: usize,
+        dim: usize,
+    ) AccelError!Self {
+        if (ctx.ctx == null) return AccelError.NullPointer;
+        if (vocab_size == 0 or dim == 0) return AccelError.InvalidDimensions;
+        const total = try checkedElementCount2(vocab_size, dim);
+        if (shadow_values.len != total) return AccelError.InvalidDimensions;
+
+        var weight = try FutharkArray2DF16.newFromFlat(ctx, shadow_values, vocab_size, dim);
+        errdefer weight.free(ctx);
+
+        const scratch = try allocScratch(allocator);
+
+        return Self{
+            .ctx = ctx,
+            .weight = weight,
+            .vocab_size = vocab_size,
+            .dim = dim,
+            .initialized = true,
+            .allocator = allocator,
+            .scratch_token_buf = scratch.tokens,
+            .scratch_token_cap = scratch.tokens.len,
+            .scratch_lengths_buf = scratch.lengths,
+            .scratch_lengths_cap = scratch_max_batch,
+            .scratch_positions_buf = scratch.positions,
+            .scratch_positions_cap = scratch_max_seq,
+        };
+    }
+
+    pub fn initFromMaster(
+        ctx: *FutharkContext,
+        allocator: std.mem.Allocator,
+        master_values: []const f32,
+        vocab_size: usize,
+        dim: usize,
+    ) AccelError!Self {
+        if (ctx.ctx == null) return AccelError.NullPointer;
+        if (vocab_size == 0 or dim == 0) return AccelError.InvalidDimensions;
+        const total = try checkedElementCount2(vocab_size, dim);
+        if (master_values.len != total) return AccelError.InvalidDimensions;
+        for (master_values) |value| if (!std.math.isFinite(value)) return AccelError.InvalidHyperparameter;
+
+        const shadow = allocator.alloc(f16, total) catch return AccelError.AllocationFailed;
+        defer allocator.free(shadow);
+        for (master_values, shadow) |master, *narrow| narrow.* = @floatCast(master);
+
+        return initFromShadow(ctx, allocator, shadow, vocab_size, dim);
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (!self.initialized) return;
+        self.weight.free(self.ctx);
+        self.allocator.free(self.scratch_positions_buf);
+        self.allocator.free(self.scratch_lengths_buf);
+        self.allocator.free(self.scratch_token_buf);
+        self.scratch_positions_buf = &[_]i64{};
+        self.scratch_lengths_buf = &[_]i64{};
+        self.scratch_token_buf = &[_]i64{};
+        self.scratch_positions_cap = 0;
+        self.scratch_lengths_cap = 0;
+        self.scratch_token_cap = 0;
+        self.initialized = false;
+    }
+
+    pub fn deviceBytes(self: *const Self) AccelError!usize {
+        const total = try checkedElementCount2(self.vocab_size, self.dim);
+        return std.math.mul(usize, total, @sizeOf(f16)) catch return AccelError.InvalidDimensions;
+    }
+
+    pub fn forwardPadded(
+        self: *Self,
+        tokens: []const u32,
+        sequence_lengths: []const usize,
+        sequence_length: usize,
+    ) AccelError!FutharkArray3DF16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (sequence_lengths.len == 0 or sequence_length == 0) return AccelError.InvalidDimensions;
+        const expected_tokens = std.math.mul(usize, sequence_lengths.len, sequence_length) catch return AccelError.InvalidDimensions;
+        if (tokens.len != expected_tokens) return AccelError.InvalidDimensions;
+
+        const token_i64s = if (tokens.len <= self.scratch_token_cap)
+            self.scratch_token_buf[0..tokens.len]
+        else
+            (self.allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed);
+        defer if (tokens.len > self.scratch_token_cap) self.allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        const lengths_i64 = if (sequence_lengths.len <= self.scratch_lengths_cap)
+            self.scratch_lengths_buf[0..sequence_lengths.len]
+        else
+            (self.allocator.alloc(i64, sequence_lengths.len) catch return AccelError.AllocationFailed);
+        defer if (sequence_lengths.len > self.scratch_lengths_cap) self.allocator.free(lengths_i64);
+        for (sequence_lengths, 0..) |length, index| {
+            if (length > sequence_length) return AccelError.InvalidDimensions;
+            lengths_i64[index] = @intCast(length);
+        }
+
+        const positions_i64 = if (sequence_length <= self.scratch_positions_cap)
+            self.scratch_positions_buf[0..sequence_length]
+        else
+            (self.allocator.alloc(i64, sequence_length) catch return AccelError.AllocationFailed);
+        defer if (sequence_length > self.scratch_positions_cap) self.allocator.free(positions_i64);
+        for (positions_i64, 0..) |*position, index| position.* = @intCast(index);
+
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths_i64);
+        defer length_array.free(self.ctx);
+        var position_array = try FutharkArray1DI64.newFromSlice(self.ctx, positions_i64);
+        defer position_array.free(self.ctx);
+
+        var output: ?*futhark.struct_futhark_f16_3d = null;
+        const result = futhark.futhark_entry_embedding_forward_padded(
+            self.ctx.ctx,
+            &output,
+            token_array.arr,
+            length_array.arr,
+            position_array.arr,
+            self.weight.arr,
+        );
+        if (result != 0 or output == null) {
+            if (output) |value| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, value);
+            return AccelError.FutharkForwardFailed;
+        }
+        return FutharkArray3DF16{
+            .arr = output,
+            .dim0 = sequence_lengths.len,
+            .dim1 = sequence_length,
+            .dim2 = self.dim,
+        };
+    }
+
+    pub fn exportMasterF32(self: *Self, allocator: std.mem.Allocator) AccelError![]f32 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        const shadow = try self.weight.valuesFlat(self.ctx, allocator);
+        defer allocator.free(shadow);
+        const widened = allocator.alloc(f32, shadow.len) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(widened);
+        for (shadow, widened) |narrow, *wide| wide.* = @floatCast(narrow);
+        return widened;
+    }
+
+    pub fn exportShadowF16(self: *Self, allocator: std.mem.Allocator) AccelError![]f16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        return self.weight.valuesFlat(self.ctx, allocator);
+    }
+};
+
 pub const EmbeddingAccelerator = struct {
     ctx: *FutharkContext,
     weight: FutharkArray2DF16,
@@ -1708,6 +1892,16 @@ pub const EmbeddingAccelerator = struct {
         if (self.scratch_lengths_buf.len > 0) self.allocator.free(self.scratch_lengths_buf);
         if (self.scratch_token_buf.len > 0) self.allocator.free(self.scratch_token_buf);
         self.initialized = false;
+    }
+
+    pub fn cloneFrozenTarget(self: *Self) AccelError!FrozenEmbeddingTarget {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        const total_elements = try checkedElementCount2(self.vocab_size, self.dim);
+        const flat = self.allocator.alloc(f16, total_elements) catch return AccelError.AllocationFailed;
+        defer self.allocator.free(flat);
+        if (futhark.futhark_values_f16_2d(self.ctx.ctx, self.weight.arr, @ptrCast(flat.ptr)) != 0) return AccelError.FutharkValuesFailed;
+        if (futhark.futhark_context_sync(self.ctx.ctx) != 0) return AccelError.FutharkSyncFailed;
+        return FrozenEmbeddingTarget.initFromShadow(self.ctx, self.allocator, flat, self.vocab_size, self.dim);
     }
 
     pub fn cloneDevice(self: *Self) AccelError!Self {

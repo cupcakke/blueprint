@@ -20,6 +20,8 @@ const FNDSManager = core_relational.FNDSManager;
 const PatternLocation = core_relational.PatternLocation;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
+const gpu_memory = @import("../hw/accel/gpu_memory.zig");
+const cuda = @import("../hw/accel/cuda_bindings.zig");
 
 const _use_futhark_2d = FutharkArray2DF16;
 const _use_tensor = Tensor;
@@ -191,6 +193,57 @@ pub const TrainerComponents = struct {
     tokenizer: MGT,
 };
 
+fn runMemoryPreflight(
+    rank: usize,
+    model_dim: usize,
+    num_layers: usize,
+    vocab_size: usize,
+    batch_size: usize,
+    config: TrainerConfig,
+) TrainerError!void {
+    const shape = gpu_memory.ModelShape{
+        .model_dim = model_dim,
+        .num_layers = num_layers,
+        .vocab_size = vocab_size,
+        .batch_size = batch_size,
+        .max_seq_len = config.default_max_seq_len,
+        .graph_chunk_size = 0,
+        .graph_nodes = 0,
+        .stack_only = config.stack_only_accelerator,
+        .minimal_frozen_target = config.target_source_frozen,
+        .momentum_enabled = true,
+        .fisher_enabled = true,
+        .skip_knowledge_graph = false,
+    };
+
+    const estimated = gpu_memory.estimate(shape) catch |err| switch (err) {
+        gpu_memory.MemoryEstimateError.InvalidDimensions => return TrainerError.InvalidModelDim,
+        gpu_memory.MemoryEstimateError.SizeOverflow => return TrainerError.MemoryEstimateOverflow,
+    };
+
+    if (comptime !accel.gpu_enabled) {
+        std.debug.print(
+            "[Rank {d}] gpu-preflight skipped (cpu build) persistent={d} B transient={d} B\n",
+            .{ rank, estimated.persistent_bytes, estimated.transient_bytes },
+        );
+        return;
+    }
+
+    const info = cuda.memoryInfo() catch return TrainerError.DeviceMemoryQueryFailed;
+    const preflight_config = gpu_memory.PreflightConfig.fromEnv();
+    const report = gpu_memory.admit(shape, preflight_config, info.total_bytes, info.free_bytes) catch |err| switch (err) {
+        gpu_memory.PreflightError.InvalidDimensions => return TrainerError.InvalidModelDim,
+        gpu_memory.PreflightError.SizeOverflow => return TrainerError.MemoryEstimateOverflow,
+        gpu_memory.PreflightError.DeviceQueryFailed => return TrainerError.DeviceMemoryQueryFailed,
+        gpu_memory.PreflightError.InsufficientDeviceMemory => return TrainerError.InsufficientDeviceMemory,
+    };
+
+    std.debug.print("[Rank {d}] gpu-preflight report\n", .{rank});
+    gpu_memory.logReport(report);
+
+    if (!report.admitted) return TrainerError.InsufficientDeviceMemory;
+}
+
 pub const TrainerError = error{
     InvalidModelDim,
     InvalidNumLayers,
@@ -260,6 +313,9 @@ pub const TrainerError = error{
     CheckpointSaveMustRunOnRoot,
     StepSynchronizerUnavailable,
     InvalidTrainingState,
+    InsufficientDeviceMemory,
+    MemoryEstimateOverflow,
+    DeviceMemoryQueryFailed,
 };
 
 fn createConfiguredTokenizer(
@@ -563,7 +619,7 @@ pub const DistributedTrainerFuthark = struct {
     knowledge_fnds_tree_id: ?[32]u8,
     knowledge_fnds_index_id: ?[]u8,
     knowledge_graph_nonce: [32]u8,
-    target_source: ?accel.EmbeddingAccelerator,
+    target_source: ?accel.FrozenEmbeddingTarget,
     shuffle_control_state: u64,
     shuffle_mutex: std.Thread.Mutex,
     relational_fast_mode: bool,
@@ -652,6 +708,15 @@ pub const DistributedTrainerFuthark = struct {
 
         const actual_model_dim = model_dim;
 
+        try runMemoryPreflight(
+            coordinator.rank,
+            actual_model_dim,
+            num_layers,
+            components.tokenizer.next_token_id,
+            local_batch_size,
+            config,
+        );
+
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
@@ -707,13 +772,23 @@ pub const DistributedTrainerFuthark = struct {
         var gpu_embedding_committed = false;
         errdefer if (!gpu_embedding_committed) gpu_embedding.deinit();
 
-        var target_source: ?accel.EmbeddingAccelerator = null;
+        var target_source: ?accel.FrozenEmbeddingTarget = null;
         var target_source_committed = false;
         errdefer if (!target_source_committed) {
             if (target_source) |*source| source.deinit();
         };
         if (config.target_source_frozen) {
-            target_source = try gpu_embedding.cloneDevice();
+            target_source = try gpu_embedding.cloneFrozenTarget();
+            std.debug.print(
+                "[Rank {d}] FrozenEmbeddingTarget vocab={d} dim={d} device_bytes={d} ({d:.3} GiB, fp16 only)\n",
+                .{
+                    coordinator.rank,
+                    target_source.?.vocab_size,
+                    target_source.?.dim,
+                    try target_source.?.deviceBytes(),
+                    @as(f64, @floatFromInt(try target_source.?.deviceBytes())) / (1024.0 * 1024.0 * 1024.0),
+                },
+            );
         }
 
         const crev_kernel_ptr = try allocator.create(ChaosCoreKernel);
@@ -2107,7 +2182,7 @@ pub const DistributedTrainerFuthark = struct {
             const context = &self.accelerator.ctx;
             context.mutex.lock();
             defer context.mutex.unlock();
-            target_master_weights = try target.master_weight.valuesFlat(target.ctx, self.allocator);
+            target_master_weights = try target.exportMasterF32(self.allocator);
         }
 
         var training_graph_buffer = std.ArrayList(u8).init(self.allocator);
@@ -2575,18 +2650,18 @@ pub const DistributedTrainerFuthark = struct {
             );
         }
 
-        var loaded_target_source: ?accel.EmbeddingAccelerator = null;
+        var loaded_target_source: ?accel.FrozenEmbeddingTarget = null;
         var loaded_target_source_committed = false;
         errdefer if (!loaded_target_source_committed) {
             if (loaded_target_source) |*source| source.deinit();
         };
         if (pending_target_master) |master| {
-            loaded_target_source = try accel.EmbeddingAccelerator.initWithMasterWeights(
+            loaded_target_source = try accel.FrozenEmbeddingTarget.initFromMaster(
                 &new_accelerator_ptr.ctx,
                 self.allocator,
+                master,
                 pending_target_vocab,
                 pending_target_dim,
-                master,
             );
         }
 

@@ -275,3 +275,203 @@ test "stack only initialization rejects invalid shapes" {
         accel.RSFAccelerator.initStackOnly(8, 0, std.testing.allocator, true),
     );
 }
+
+test "minimal frozen target exposes only the fp16 weight" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const vocab: usize = 7;
+    const dim: usize = 4;
+    var shadow: [vocab * dim]f16 = undefined;
+    for (&shadow, 0..) |*value, index| value.* = @floatCast(@as(f32, @floatFromInt(index)) * 0.125);
+
+    var target = try accel.FrozenEmbeddingTarget.initFromShadow(
+        &ctx,
+        std.testing.allocator,
+        &shadow,
+        vocab,
+        dim,
+    );
+    defer target.deinit();
+
+    try std.testing.expect(target.initialized);
+    try std.testing.expectEqual(vocab, target.vocab_size);
+    try std.testing.expectEqual(dim, target.dim);
+    try std.testing.expectEqual(vocab * dim * @sizeOf(f16), try target.deviceBytes());
+    try std.testing.expect(!@hasField(accel.FrozenEmbeddingTarget, "master_weight"));
+    try std.testing.expect(!@hasField(accel.FrozenEmbeddingTarget, "grad_weight"));
+    try std.testing.expect(!@hasField(accel.FrozenEmbeddingTarget, "momentum_state"));
+    try std.testing.expect(!@hasField(accel.FrozenEmbeddingTarget, "fisher_state"));
+    try std.testing.expect(!@hasField(accel.FrozenEmbeddingTarget, "optimizer_step"));
+}
+
+test "minimal frozen target is a fraction of the full embedding accelerator footprint" {
+    const vocab: usize = 32000;
+    const dim: usize = 16384;
+    const elements: usize = vocab * dim;
+
+    const minimal = gpu_memory.ModelShape{
+        .model_dim = dim,
+        .num_layers = 11,
+        .vocab_size = vocab,
+        .batch_size = 32,
+        .max_seq_len = 256,
+        .stack_only = true,
+        .minimal_frozen_target = true,
+    };
+    var full = minimal;
+    full.minimal_frozen_target = false;
+
+    const minimal_estimate = try gpu_memory.estimate(minimal);
+    const full_estimate = try gpu_memory.estimate(full);
+
+    const saved = full_estimate.persistent_bytes - minimal_estimate.persistent_bytes;
+    try std.testing.expectEqual(elements * 2 * @sizeOf(f32), saved);
+
+    var found_minimal = false;
+    for (minimal_estimate.items()) |item| {
+        if (std.mem.eql(u8, item.name, "frozen target fp16 weight")) {
+            found_minimal = true;
+            try std.testing.expectEqual(elements * @sizeOf(f16), item.bytes);
+        }
+    }
+    try std.testing.expect(found_minimal);
+}
+
+test "minimal frozen target round trips fp32 master export without retaining it" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const vocab: usize = 5;
+    const dim: usize = 6;
+    var master: [vocab * dim]f32 = undefined;
+    for (&master, 0..) |*value, index| value.* = (@as(f32, @floatFromInt(index)) - 15.0) * 0.03125;
+
+    var target = try accel.FrozenEmbeddingTarget.initFromMaster(
+        &ctx,
+        std.testing.allocator,
+        &master,
+        vocab,
+        dim,
+    );
+    defer target.deinit();
+
+    const exported = try target.exportMasterF32(std.testing.allocator);
+    defer std.testing.allocator.free(exported);
+    try std.testing.expectEqual(master.len, exported.len);
+    for (master, exported) |original, restored| {
+        try std.testing.expectApproxEqAbs(original, restored, 1e-3);
+    }
+
+    var reloaded = try accel.FrozenEmbeddingTarget.initFromMaster(
+        &ctx,
+        std.testing.allocator,
+        exported,
+        vocab,
+        dim,
+    );
+    defer reloaded.deinit();
+
+    const first = try target.exportShadowF16(std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    const second = try reloaded.exportShadowF16(std.testing.allocator);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualSlices(f16, first, second);
+}
+
+test "minimal frozen target rejects invalid shapes and non finite masters" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const shadow = [_]f16{ 0.5, 0.25, 0.125, 0.0625 };
+    try std.testing.expectError(
+        accel.AccelError.InvalidDimensions,
+        accel.FrozenEmbeddingTarget.initFromShadow(&ctx, std.testing.allocator, &shadow, 0, 4),
+    );
+    try std.testing.expectError(
+        accel.AccelError.InvalidDimensions,
+        accel.FrozenEmbeddingTarget.initFromShadow(&ctx, std.testing.allocator, &shadow, 2, 0),
+    );
+    try std.testing.expectError(
+        accel.AccelError.InvalidDimensions,
+        accel.FrozenEmbeddingTarget.initFromShadow(&ctx, std.testing.allocator, &shadow, 3, 4),
+    );
+
+    const bad = [_]f32{ 1.0, 2.0, std.math.inf(f32), 4.0 };
+    try std.testing.expectError(
+        accel.AccelError.InvalidHyperparameter,
+        accel.FrozenEmbeddingTarget.initFromMaster(&ctx, std.testing.allocator, &bad, 2, 2),
+    );
+
+    const nan = [_]f32{ 1.0, 2.0, 3.0, std.math.nan(f32) };
+    try std.testing.expectError(
+        accel.AccelError.InvalidHyperparameter,
+        accel.FrozenEmbeddingTarget.initFromMaster(&ctx, std.testing.allocator, &nan, 2, 2),
+    );
+}
+
+test "minimal frozen target cleans up on every allocation failure" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const master = [_]f32{ 0.5, -0.25, 0.125, -0.0625, 1.0, -1.0 };
+
+    var failure_index: usize = 0;
+    while (failure_index < 6) : (failure_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
+        const result = accel.FrozenEmbeddingTarget.initFromMaster(
+            &ctx,
+            failing.allocator(),
+            &master,
+            3,
+            2,
+        );
+        if (result) |value| {
+            var owned = value;
+            owned.deinit();
+        } else |err| {
+            try std.testing.expectEqual(accel.AccelError.AllocationFailed, err);
+        }
+    }
+}
+
+test "minimal frozen target deinit is idempotent" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const shadow = [_]f16{ 0.5, 0.25, 0.125, 0.0625 };
+    var target = try accel.FrozenEmbeddingTarget.initFromShadow(
+        &ctx,
+        std.testing.allocator,
+        &shadow,
+        2,
+        2,
+    );
+    target.deinit();
+    try std.testing.expect(!target.initialized);
+    target.deinit();
+    try std.testing.expect(!target.initialized);
+    try std.testing.expectEqual(@as(usize, 0), target.scratch_token_cap);
+}
+
+test "embedding accelerator clones a frozen target that matches its fp16 weight" {
+    var ctx = try accel.FutharkContext.init();
+    defer ctx.deinit();
+
+    const vocab: usize = 9;
+    const dim: usize = 4;
+    var embedding = try accel.EmbeddingAccelerator.init(std.testing.allocator, &ctx, vocab, dim, 1234);
+    defer embedding.deinit();
+
+    var target = try embedding.cloneFrozenTarget();
+    defer target.deinit();
+
+    try std.testing.expectEqual(vocab, target.vocab_size);
+    try std.testing.expectEqual(dim, target.dim);
+
+    const source = try embedding.weight.valuesFlat(&ctx, std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    const cloned = try target.exportShadowF16(std.testing.allocator);
+    defer std.testing.allocator.free(cloned);
+    try std.testing.expectEqualSlices(f16, source, cloned);
+}
