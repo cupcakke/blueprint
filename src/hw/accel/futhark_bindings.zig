@@ -4,6 +4,23 @@ const _build_gpu_enabled: bool = blk: {
     break :blk false;
 };
 
+pub const abi = @import("futhark_abi.zig");
+
+comptime {
+    if (_build_gpu_enabled and abi.tuple_outputs_flattened) {
+        @compileError(
+            "Futhark ABI mismatch: the generated GPU artifacts in src/hw/accel were produced by " ++
+                abi.futhark_version ++
+                " which flattens tuple-returning entry points into multiple out-parameters, but these " ++
+                "bindings require the opaque-tuple ABI introduced in Futhark 0.26.1 " ++
+                "(futhark_project_opaque_tupN_*). Regenerate with Futhark >= 0.26.1: " ++
+                "`zig build regen-futhark && zig build regen-abi`. " ++
+                "Linking these bindings against flattened-ABI artifacts would silently corrupt " ++
+                "the stack at run time rather than fail to link.",
+        );
+    }
+}
+
 pub const struct_futhark_context_config = opaque {};
 pub const struct_futhark_context = opaque {};
 pub const struct_futhark_f16_2d = opaque {};

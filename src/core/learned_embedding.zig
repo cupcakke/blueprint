@@ -535,7 +535,14 @@ test "LearnedEmbedding batched backward accumulates only valid lengths" {
     emb.zeroGrad();
     emb.backwardAccumulate(&tokens, &lengths, grad, 4, 2);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[1 * 4 + 0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[3 * 4 + 0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[1 * 4 + 0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[3 * 4 + 0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0], 1e-6);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[2 * 4 + 0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[4 * 4 + 0], 1e-6);
+    var padded_col: usize = 0;
+    while (padded_col < 4) : (padded_col += 1) {
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0 * 4 + padded_col], 1e-6);
+    }
 }

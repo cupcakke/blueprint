@@ -47,6 +47,31 @@ pub fn build(b: *std.Build) void {
     });
     futhark_gpu_step.setCwd(b.path(accel_dir_path));
 
+    const abi_gen_cmd = &[_][]const u8{
+        "python3",
+        "tools/futhark_abi_gen.py",
+        "src/hw/accel/main_gpu.json",
+        "--zig-out",
+        "src/hw/accel/futhark_abi.zig",
+        "--c-out",
+        "src/hw/accel/futhark_abi_check.c",
+        "--header",
+        "main_gpu.h",
+    };
+
+    const abi_regen_step = b.addSystemCommand(abi_gen_cmd);
+    abi_regen_step.setCwd(b.path("."));
+    abi_regen_step.step.dependOn(&futhark_gpu_step.step);
+
+    const abi_verify_step = b.addSystemCommand(abi_gen_cmd ++ &[_][]const u8{"--check"});
+    abi_verify_step.setCwd(b.path("."));
+
+    const regen_abi = b.step("regen-abi", "Regenerate Futhark FFI bindings from the compiler manifest");
+    regen_abi.dependOn(&abi_regen_step.step);
+
+    const check_abi = b.step("check-abi", "Verify Futhark FFI bindings match the compiler manifest");
+    check_abi.dependOn(&abi_verify_step.step);
+
     const core_relational_mod = b.createModule(.{
         .root_source_file = b.path("src/core_relational/mod.zig"),
         .target = target,
@@ -119,7 +144,9 @@ pub fn build(b: *std.Build) void {
         distributed_futhark_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
 
         if (!skip_futhark) {
-            distributed_futhark_exe.step.dependOn(&futhark_gpu_step.step);
+            distributed_futhark_exe.step.dependOn(&abi_regen_step.step);
+        } else {
+            distributed_futhark_exe.step.dependOn(&abi_verify_step.step);
         }
 
         const distributed_futhark_install = b.addInstallArtifact(distributed_futhark_exe, .{});
