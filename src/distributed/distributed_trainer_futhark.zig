@@ -2809,6 +2809,3 @@ pub const DistributedTrainerFuthark = struct {
         try self.r_gpu.distributeGraph(self.knowledge_nsir_graph);
     }
 };
-ge_nsir_graph);
-    }
-};
