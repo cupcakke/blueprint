@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const _build_gpu_enabled: bool = blk: {
     const opts = @import("build_options");
     if (@hasDecl(opts, "gpu_acceleration")) break :blk opts.gpu_acceleration;
@@ -42,13 +44,14 @@ pub fn configureGpuContext(
     cache_file: ?[*:0]const u8,
 ) GpuConfigurationError!void {
     if (comptime _build_gpu_enabled) {
-        // Managed memory + Futhark debug logging is what made dim=16384 look
-        // "stuck": every allocation dumped NVRTC flags, then cudaMallocManaged
-        // of the first ~3 GiB stack hung for an hour with no training steps.
-        futhark_context_config_set_logging(cfg, 0);
-        futhark_context_config_set_debugging(cfg, 0);
-        futhark_context_config_set_profiling(cfg, 0);
-        futhark_context_config_set_unified_memory(cfg, 0);
+        const log_on = if (std.posix.getenv("JAIDE_FUTHARK_LOGGING")) |v| std.mem.eql(u8, v, "1") else false;
+        const dbg_on = if (std.posix.getenv("JAIDE_FUTHARK_DEBUGGING")) |v| std.mem.eql(u8, v, "1") else false;
+        const prof_on = if (std.posix.getenv("JAIDE_FUTHARK_PROFILING")) |v| std.mem.eql(u8, v, "1") else false;
+        const unified = if (std.posix.getenv("JAIDE_FUTHARK_UNIFIED_MEMORY")) |v| std.mem.eql(u8, v, "1") else false;
+        futhark_context_config_set_logging(cfg, if (log_on) 1 else 0);
+        futhark_context_config_set_debugging(cfg, if (dbg_on) 1 else 0);
+        futhark_context_config_set_profiling(cfg, if (prof_on) 1 else 0);
+        futhark_context_config_set_unified_memory(cfg, if (unified) 1 else 0);
         futhark_context_config_set_device(cfg, "");
         futhark_context_config_set_default_group_size(cfg, gpu_default_group_size);
         futhark_context_config_set_default_num_groups(cfg, gpu_default_num_groups);

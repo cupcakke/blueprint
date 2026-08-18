@@ -85,6 +85,8 @@ const RealApi = struct {
     pub extern "c" fn cudaGetDeviceCount(count: *c_int) cudaError_t;
     pub extern "c" fn cudaSetDevice(device: c_int) cudaError_t;
     pub extern "c" fn cudaGetDevice(device: *c_int) cudaError_t;
+    pub extern "c" fn cudaMemGetInfo(free: *usize, total: *usize) cudaError_t;
+    pub extern "c" fn cudaGetDeviceProperties(prop: ?*anyopaque, device: c_int) cudaError_t;
 
     pub extern "c" fn cublasCreate_v2(handle: *cublasHandle_t) cublasStatus_t;
     pub extern "c" fn cublasDestroy_v2(handle: cublasHandle_t) cublasStatus_t;
@@ -167,6 +169,8 @@ pub const cudaStreamDestroy = RealApi.cudaStreamDestroy;
 pub const cudaGetDeviceCount = RealApi.cudaGetDeviceCount;
 pub const cudaSetDevice = RealApi.cudaSetDevice;
 pub const cudaGetDevice = RealApi.cudaGetDevice;
+pub const cudaMemGetInfo = RealApi.cudaMemGetInfo;
+pub const cudaGetDeviceProperties = RealApi.cudaGetDeviceProperties;
 pub const cublasCreate_v2 = RealApi.cublasCreate_v2;
 pub const cublasDestroy_v2 = RealApi.cublasDestroy_v2;
 pub const cublasSetStream_v2 = RealApi.cublasSetStream_v2;

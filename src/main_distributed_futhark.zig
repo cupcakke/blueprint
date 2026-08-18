@@ -1202,6 +1202,7 @@ pub fn main() !void {
     const use_normalized_gradient_flow = (try parseOptionalEnvironmentBool(allocator, "JAIDE_NORMALIZED_GRADIENT_FLOW")) orelse true;
     const spectral_target_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SPECTRAL_NORM_TARGET")) orelse 0.9;
     const spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_POWER_ITERATIONS")) orelse 30;
+    const init_spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_INIT_SPECTRAL_ITERS")) orelse 0;
     const spectral_interval = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_INTERVAL")) orelse 10;
     const trust_ratio = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_TRUST_RATIO")) orelse 0.1;
     const weight_floor = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_WEIGHT_FLOOR")) orelse 1e-3;
@@ -1495,6 +1496,10 @@ pub fn main() !void {
         .{ rank, grad_mean, use_normalized_gradient_flow, gradient_clip_norm, trust_ratio, weight_floor, logdet_weight, spectral_target_norm, spectral_iterations, spectral_interval },
     );
     std.debug.print(
+        "[Rank {d}] init_spectral_iterations={d} skip_knowledge_graph default=1\n",
+        .{ rank, init_spectral_iterations },
+    );
+    std.debug.print(
         "[Rank {d}] Futhark trainer initialized with model_dim={d}, layers={d}\n",
         .{
             rank,
@@ -1531,18 +1536,66 @@ pub fn main() !void {
     var graph_stage_error: ?anyerror = null;
 
     graph_construction: {
-        // Offline import of the full corpus (500k hashes → 1.5M edges into a
-        // CPU HashMap, plus a second JSONL scan) is not O(d) and blocked the
-        // first epoch for an hour. The relational pass already runs online on
-        // the current batch (`runCoreRelationalPass`).
-        if (coordinator.isRoot()) {
-            std.debug.print(
-                "[Rank {d}] Skipping offline knowledge-graph import of {d} samples; relational pass is online per batch\n",
-                .{ rank, samples.len },
-            );
+        const skip_knowledge_graph = (parseOptionalEnvironmentBool(allocator, "JAIDE_SKIP_KNOWLEDGE_GRAPH") catch |err| {
+            graph_stage_error = err;
+            break :graph_construction;
+        }) orelse true;
+        const graph_chunk_size = (parseOptionalEnvironmentUsize(allocator, "JAIDE_GRAPH_CHUNK_SIZE") catch |err| {
+            graph_stage_error = err;
+            break :graph_construction;
+        }) orelse 4096;
+        if (skip_knowledge_graph or resumed_from_checkpoint) {
+            if (coordinator.isRoot()) {
+                std.debug.print(
+                    "[Rank {d}] Skipping offline knowledge-graph import samples={d} skip={} resumed={} chunk={d}\n",
+                    .{ rank, samples.len, skip_knowledge_graph, resumed_from_checkpoint, graph_chunk_size },
+                );
+            }
+            break :graph_construction;
         }
-        _ = resumed_from_checkpoint;
-        break :graph_construction;
+        if (graph_chunk_size == 0) {
+            graph_stage_error = error.InvalidEnvironmentValue;
+            break :graph_construction;
+        }
+        const hashes = loadDatasetHashes(allocator, dataset_path, 10 * 1024 * 1024) catch |err| {
+            graph_stage_error = err;
+            break :graph_construction;
+        };
+        defer allocator.free(hashes);
+        var offset: usize = 0;
+        while (offset < hashes.len) {
+            const remaining = hashes.len - offset;
+            const take = if (remaining < graph_chunk_size) remaining else graph_chunk_size;
+            const chunk = hashes[offset .. offset + take];
+            var encoded = accel_interface.batchEncodeGraph(&trainer.accelerator.ctx, chunk, embedding_seed, allocator) catch |err| {
+                graph_stage_error = err;
+                break :graph_construction;
+            };
+            defer encoded.deinit();
+            trainer.knowledge_nsir_graph.bulkImportFromGPU(
+                encoded.hashes,
+                encoded.re_a,
+                encoded.im_a,
+                encoded.re_b,
+                encoded.im_b,
+                encoded.edge_srcs,
+                encoded.edge_tgts,
+            ) catch |err| {
+                graph_stage_error = err;
+                break :graph_construction;
+            };
+            offset += take;
+            if (coordinator.isRoot()) {
+                std.debug.print(
+                    "[Rank {d}] knowledge graph chunk imported {d}/{d}\n",
+                    .{ rank, offset, hashes.len },
+                );
+            }
+        }
+        trainer.r_gpu.distributeGraphFast(trainer.knowledge_nsir_graph) catch |err| {
+            graph_stage_error = err;
+            break :graph_construction;
+        };
     }
 
     synchronizeStageStatus(
@@ -1564,7 +1617,7 @@ pub fn main() !void {
 
     const graph_elapsed = std.time.nanoTimestamp() - graph_started;
     std.debug.print(
-        "[Rank {d}] Knowledge graph stage skipped (online per-batch) graph_ms={d}\n",
+        "[Rank {d}] Knowledge graph stage finished graph_ms={d}\n",
         .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
     );
     const startup_elapsed = std.time.nanoTimestamp() - startup_started;

@@ -3,6 +3,8 @@ const GPUCoordinator = @import("gpu_coordinator.zig").GPUCoordinator;
 const checkpoint_envelope = @import("checkpoint_envelope.zig");
 const MGT = @import("../tokenizer/mgt.zig").MGT;
 const accel = @import("../hw/accel/accel_interface.zig");
+const gpu_memory = @import("../hw/accel/gpu_memory.zig");
+const compact_batch = @import("../hw/accel/compact_batch.zig");
 const RSFAccelerator = accel.RSFAccelerator;
 const FutharkArray2DF16 = accel.FutharkArray2DF16;
 const FutharkArray3DF16 = accel.FutharkArray3DF16;
@@ -145,6 +147,7 @@ pub const TrainerConfig = struct {
     knowledge_fnds_index_name: []const u8 = "knowledge_graph_patterns",
     embedding_seed: u64 = 42,
     spectral_iterations: usize = 30,
+    init_spectral_iterations: usize = 0,
     spectral_target_norm: f32 = 0.9,
     gradient_clip_norm: f32 = 1.0,
     clip_min: f32 = -5.0,
@@ -255,6 +258,8 @@ pub const TrainerError = error{
     DistributedConfigMismatch,
     InvalidRelationalPassInterval,
     RelationalPassFailed,
+    MemoryAdmissionRejected,
+    DeviceMemoryQueryFailed,
     CheckpointSaveFailed,
     CheckpointSaveMustRunOnRoot,
     StepSynchronizerUnavailable,
@@ -562,7 +567,7 @@ pub const DistributedTrainerFuthark = struct {
     knowledge_fnds_tree_id: ?[32]u8,
     knowledge_fnds_index_id: ?[]u8,
     knowledge_graph_nonce: [32]u8,
-    target_source: ?accel.EmbeddingAccelerator,
+    target_source: ?accel.FrozenEmbedding,
     shuffle_control_state: u64,
     shuffle_mutex: std.Thread.Mutex,
     relational_fast_mode: bool,
@@ -651,6 +656,52 @@ pub const DistributedTrainerFuthark = struct {
 
         const actual_model_dim = model_dim;
 
+        const vocab_size_init = components.tokenizer.next_token_id;
+        const estimate_config = gpu_memory.EstimateConfig{
+            .model_dim = actual_model_dim,
+            .num_layers = num_layers,
+            .vocab_size = vocab_size_init,
+            .batch_size = local_batch_size,
+            .max_seq_len = config.default_max_seq_len,
+            .world_size = coordinator.world_size,
+            .stack_only = true,
+            .frozen_target_f16_only = config.target_source_frozen,
+            .include_graph_chunk = false,
+            .spectral_temps = false,
+            .coupling = .diagonal,
+        };
+        const device_memory = gpu_memory.queryDeviceMemory() catch |err| {
+            std.debug.print("[Trainer] DEVICE_MEMORY_QUERY_FAILED err={s}\n", .{@errorName(err)});
+            return TrainerError.DeviceMemoryQueryFailed;
+        };
+        const admission = gpu_memory.admit(estimate_config, device_memory) catch |err| {
+            std.debug.print("[Trainer] MEMORY_ESTIMATE_FAILED err={s}\n", .{@errorName(err)});
+            return TrainerError.MemoryAdmissionRejected;
+        };
+        std.debug.print(
+            "[Trainer] memory_admit device_free={d} device_total={d} reserve={d} budget={d} persistent={d} transient={d} peak={d} rsf={d} embedding={d} activations={d} accepted={}\n",
+            .{
+                admission.free_bytes,
+                admission.total_bytes,
+                admission.reserve_bytes,
+                admission.budget_bytes,
+                admission.estimate.persistent_bytes,
+                admission.estimate.transient_bytes,
+                admission.estimate.peak_bytes,
+                admission.estimate.rsf_param_bytes,
+                admission.estimate.embedding_param_bytes,
+                admission.estimate.activation_bytes,
+                admission.accepted,
+            },
+        );
+        if (!admission.accepted) {
+            std.debug.print(
+                "[Trainer] MEMORY_ADMISSION_REJECTED largest={s} bytes={d} peak={d} budget={d}\n",
+                .{ admission.largest_name, admission.largest_bytes, admission.estimate.peak_bytes, admission.budget_bytes },
+            );
+            return TrainerError.MemoryAdmissionRejected;
+        }
+
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
@@ -670,13 +721,9 @@ pub const DistributedTrainerFuthark = struct {
             try checkedF32ToF16(config.clip_min),
             try checkedF32ToF16(config.clip_max),
         );
-        if (config.spectral_iterations > 0) {
-            // Random init already uses a small depth-compensated stddev, so a
-            // single power iteration is enough to bound the spectrum. Coupling
-            // is diagonal O(d); the old dense O(d^2) stack is gone.
-            const init_spectral_iters: usize = @min(config.spectral_iterations, 1);
-            std.debug.print("[Trainer] init spectral normalize iters={d}\n", .{init_spectral_iters});
-            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, init_spectral_iters);
+        if (config.init_spectral_iterations > 0) {
+            std.debug.print("[Trainer] init spectral normalize iters={d}\n", .{config.init_spectral_iterations});
+            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.init_spectral_iterations);
         }
 
         std.debug.print(
@@ -693,14 +740,14 @@ pub const DistributedTrainerFuthark = struct {
         var gpu_embedding_committed = false;
         errdefer if (!gpu_embedding_committed) gpu_embedding.deinit();
 
-        var target_source: ?accel.EmbeddingAccelerator = null;
+        var target_source: ?accel.FrozenEmbedding = null;
         var target_source_committed = false;
         errdefer if (!target_source_committed) {
             if (target_source) |*source| source.deinit();
         };
         if (config.target_source_frozen) {
-            std.debug.print("[Trainer] cloning frozen target embeddings\n", .{});
-            target_source = try gpu_embedding.cloneDevice();
+            std.debug.print("[Trainer] allocating frozen target embeddings f16-only\n", .{});
+            target_source = try accel.FrozenEmbedding.initFromTrainableMaster(&gpu_embedding);
         }
         std.debug.print("[Trainer] model buffers ready\n", .{});
 
@@ -827,6 +874,7 @@ pub const DistributedTrainerFuthark = struct {
             self.config.reasoning_cycles,
             self.config.embedding_seed,
             self.config.spectral_iterations,
+            self.config.init_spectral_iterations,
             @as(u32, @bitCast(self.config.spectral_target_norm)),
             @as(u32, @bitCast(self.config.gradient_clip_norm)),
             @as(u32, @bitCast(self.config.clip_min)),
@@ -1445,7 +1493,8 @@ pub const DistributedTrainerFuthark = struct {
             real_sequence_lengths[index] = @min(token_list.items.len - 1, sequence_length);
         }
 
-        const flat_size = try std.math.mul(usize, effective_batch_size, sequence_length);
+        const compact_seq = compact_batch.compactSequenceLength(real_sequence_lengths);
+        const flat_size = try compact_batch.packedTokenCount(effective_batch_size, compact_seq);
         const flat_input_tokens = try self.allocator.alloc(u32, flat_size);
         errdefer self.allocator.free(flat_input_tokens);
         const flat_target_tokens = try self.allocator.alloc(u32, flat_size);
@@ -1459,7 +1508,7 @@ pub const DistributedTrainerFuthark = struct {
             while (sequence_index < prediction_length) : (sequence_index += 1) {
                 const flat_index = try std.math.add(
                     usize,
-                    try std.math.mul(usize, batch_index, sequence_length),
+                    try std.math.mul(usize, batch_index, compact_seq),
                     sequence_index,
                 );
                 const input_token = token_list.items[sequence_index];
@@ -1498,7 +1547,7 @@ pub const DistributedTrainerFuthark = struct {
             .flat_input_tokens = flat_input_tokens,
             .flat_target_tokens = flat_target_tokens,
             .effective_batch_size = effective_batch_size,
-            .sequence_length = sequence_length,
+            .sequence_length = compact_seq,
             .local_active_samples = local_active_samples,
             .local_token_count = local_token_count,
         };
@@ -2095,7 +2144,7 @@ pub const DistributedTrainerFuthark = struct {
             const context = &self.accelerator.ctx;
             context.mutex.lock();
             defer context.mutex.unlock();
-            target_master_weights = try target.master_weight.valuesFlat(target.ctx, self.allocator);
+            target_master_weights = try target.exportAsF32(self.allocator);
         }
 
         var training_graph_buffer = std.ArrayList(u8).init(self.allocator);
@@ -2694,7 +2743,6 @@ pub const DistributedTrainerFuthark = struct {
         const rows = embedding.vocab_size;
         const columns = embedding.dim;
         if (rows == 0 or columns == 0 or self.spectral_normalizer.power_iterations == 0) return;
-        self.resetSpectralState();
         try self.ensureSpectralState(rows, columns);
         const u = &self.gpu_spectral_u.?;
         const v = &self.gpu_spectral_v.?;
@@ -2759,5 +2807,8 @@ pub const DistributedTrainerFuthark = struct {
         pattern_transferred = true;
 
         try self.r_gpu.distributeGraph(self.knowledge_nsir_graph);
+    }
+};
+ge_nsir_graph);
     }
 };

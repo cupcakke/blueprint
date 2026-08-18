@@ -109,6 +109,29 @@ RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
 NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "0") == "1"
 FORCE_REBUILD = os.environ.get("JAIDE_BENCH_FORCE_REBUILD", "0") == "1"
 SKIP_PREP = os.environ.get("JAIDE_BENCH_SKIP_PREP", "0") == "1"
+INIT_DEADLINE_SEC = int(os.environ.get("JAIDE_BENCH_INIT_DEADLINE", "1800"))
+IDLE_WATCHDOG_SEC = int(os.environ.get("JAIDE_BENCH_IDLE_WATCHDOG", "900"))
+SKIP_KNOWLEDGE_GRAPH = os.environ.get("JAIDE_BENCH_SKIP_KNOWLEDGE_GRAPH", "1")
+GRAPH_CHUNK_SIZE = os.environ.get("JAIDE_BENCH_GRAPH_CHUNK_SIZE", "4096")
+INIT_SPECTRAL_ITERS = os.environ.get("JAIDE_BENCH_INIT_SPECTRAL_ITERS", "0")
+
+SOURCE_FINGERPRINT_PATHS = (
+    "src/hw/accel/main.fut",
+    "src/hw/accel/futhark_kernels.fut",
+    "src/hw/accel/accel_interface.zig",
+    "src/hw/accel/futhark_bindings.zig",
+    "src/hw/accel/cuda_bindings.zig",
+    "src/hw/accel/gpu_memory.zig",
+    "src/hw/accel/compact_batch.zig",
+    "src/hw/accel/futhark_abi_check.c",
+    "src/hw/accel/tensor_core_matmul.zig",
+    "src/distributed/distributed_trainer_futhark.zig",
+    "src/distributed/checkpoint_envelope.zig",
+    "src/distributed/nccl_bindings.zig",
+    "src/main_distributed_futhark.zig",
+    "src/api/inference_server.zig",
+    "build.zig",
+)
 
 app = modal.App(APP_NAME)
 
@@ -178,13 +201,51 @@ def _safe_unlink(path: Path) -> None:
         return
 
 
-def _find_latest_binary(name: str) -> Optional[Path]:
+def _source_fingerprint(root: Path = LOCAL_PROJECT_DIR) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"zig-0.14.1\n")
+    digest.update(b"futhark-0.26.4-cuda-sm100\n")
+    digest.update(b"checkpoint-v7\n")
+    digest.update(b"rsf-coupling-2-stack-only\n")
+    for relative in SOURCE_FINGERPRINT_PATHS:
+        path = root / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_file():
+            digest.update(path.read_bytes())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _fingerprint_sidecar(path: Path) -> Path:
+    return path.with_name(path.name + ".fingerprint")
+
+
+def _write_fingerprint(path: Path, fingerprint: str) -> None:
+    sidecar = _fingerprint_sidecar(path)
+    sidecar.write_text(fingerprint + "\n", encoding="utf-8")
+
+
+def _fingerprint_matches(path: Path, fingerprint: str) -> bool:
+    sidecar = _fingerprint_sidecar(path)
+    if not sidecar.is_file():
+        return False
+    try:
+        stored = sidecar.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return stored == fingerprint
+
+
+def _find_latest_binary(name: str, fingerprint: Optional[str] = None) -> Optional[Path]:
     if not BUILD_MOUNT_PATH.exists():
         return None
     candidates: List[Path] = []
     for path in BUILD_MOUNT_PATH.rglob(name):
         try:
             if path.is_file() and path.stat().st_size > 0:
+                if fingerprint is not None and not _fingerprint_matches(path, fingerprint):
+                    continue
                 candidates.append(path)
         except OSError:
             continue
@@ -192,6 +253,23 @@ def _find_latest_binary(name: str) -> Optional[Path]:
         return None
     candidates.sort(key=lambda p: (p.stat().st_mtime_ns, str(p)), reverse=True)
     return candidates[0]
+
+
+def _classify_training_failure(output: str, timed_out: bool, init_seen: bool) -> str:
+    lowered = output.lower()
+    if "memory_admission_rejected" in lowered:
+        return "admission_rejected"
+    if "device_memory_query_failed" in lowered:
+        return "device_query_failed"
+    if "out of memory" in lowered or "cudaerror 2" in lowered or "memoryallocation" in lowered:
+        return "oom"
+    if "using managed memory" in lowered and not init_seen:
+        return "unified_memory_stall"
+    if timed_out and not init_seen:
+        return "init_stall"
+    if timed_out:
+        return "idle_stall"
+    return "unknown"
 
 
 def _clear_rank_coordination_files(nccl_id_path: str) -> None:
@@ -319,6 +397,9 @@ def _run_multirank(
     num_gpus: int,
     nccl_id_path: str,
     timeout: int,
+    init_deadline_sec: Optional[int] = None,
+    idle_watchdog_sec: Optional[int] = None,
+    init_marker: str = "[Step ",
 ) -> Tuple[int, str, float]:
     if num_gpus <= 0:
         raise ValueError("A GPU-k számának legalább 1-nek kell lennie")
@@ -347,6 +428,9 @@ def _run_multirank(
     output_chunks: List[bytes] = []
     selector = selectors.DefaultSelector()
     timed_out = False
+    last_output = time.monotonic()
+    init_seen = False
+    stall_reason = None
 
     try:
         for rank_index in range(num_gpus):
@@ -374,6 +458,19 @@ def _run_multirank(
             now = time.monotonic()
             if now >= deadline:
                 timed_out = True
+                stall_reason = "global_timeout"
+                for proc in procs:
+                    _terminate_process_group(proc)
+                break
+            if not init_seen and init_deadline_sec is not None and (now - t0) >= init_deadline_sec:
+                timed_out = True
+                stall_reason = "init_deadline"
+                for proc in procs:
+                    _terminate_process_group(proc)
+                break
+            if idle_watchdog_sec is not None and (now - last_output) >= idle_watchdog_sec:
+                timed_out = True
+                stall_reason = "idle_watchdog"
                 for proc in procs:
                     _terminate_process_group(proc)
                 break
@@ -400,6 +497,10 @@ def _run_multirank(
                         pass
                     open_streams -= 1
                     continue
+                last_output = now
+                decoded = chunk.decode("utf-8", errors="replace")
+                if init_marker in decoded:
+                    init_seen = True
                 prefix = f"[GPU-{rank_index}] ".encode("utf-8")
                 for line in chunk.splitlines(keepends=True):
                     output_chunks.append(prefix + line)
@@ -424,9 +525,12 @@ def _run_multirank(
     returncodes = [proc.returncode for proc in procs]
     failures = [int(code) for code in returncodes if code not in (None, 0)]
     combined_rc = 0 if not failures else max(failures)
-    _log(f"<<< több-GPU futtatás GPU-szám={num_gpus} kódok={returncodes} időtartam={dt:.2f}s")
+    classification = _classify_training_failure(combined_out, timed_out, init_seen)
+    _log(f"<<< több-GPU futtatás GPU-szám={num_gpus} kódok={returncodes} időtartam={dt:.2f}s class={classification} init_seen={init_seen} stall={stall_reason}")
     if timed_out:
-        raise subprocess.TimeoutExpired(cmd, timeout, output=combined_out.encode("utf-8"))
+        raise RuntimeError(
+            f"training_watchdog class={classification} stall={stall_reason} init_seen={init_seen}\n{combined_out}"
+        )
     return combined_rc, combined_out, dt
 
 
@@ -641,8 +745,10 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     )
 
     dataset_path = Path(DATASET_PATH)
-    existing_dist = _find_latest_binary("jaide-distributed-futhark")
-    existing_inf = _find_latest_binary("jaide-inference-server")
+    source_fp = _source_fingerprint(Path(project_dir))
+    result["source_fingerprint"] = source_fp
+    existing_dist = _find_latest_binary("jaide-distributed-futhark", source_fp)
+    existing_inf = _find_latest_binary("jaide-inference-server", source_fp)
     dataset_exists = dataset_path.exists() and dataset_path.stat().st_size > 0
 
     if not FORCE_REBUILD and existing_dist and existing_inf and dataset_exists:
@@ -652,10 +758,14 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
 
         build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
         build_target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(existing_dist), str(build_target_dir / "jaide-distributed-futhark"))
-        os.chmod(str(build_target_dir / "jaide-distributed-futhark"), 0o755)
-        shutil.copy2(str(existing_inf), str(build_target_dir / "jaide-inference-server"))
-        os.chmod(str(build_target_dir / "jaide-inference-server"), 0o755)
+        dist_dst = build_target_dir / "jaide-distributed-futhark"
+        inf_dst = build_target_dir / "jaide-inference-server"
+        shutil.copy2(str(existing_dist), str(dist_dst))
+        os.chmod(str(dist_dst), 0o755)
+        _write_fingerprint(dist_dst, source_fp)
+        shutil.copy2(str(existing_inf), str(inf_dst))
+        os.chmod(str(inf_dst), 0o755)
+        _write_fingerprint(inf_dst, source_fp)
 
         line_count = _count_nonempty_lines(dataset_path)
         size = dataset_path.stat().st_size
@@ -753,16 +863,20 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     build_target_dir.mkdir(parents=True, exist_ok=True)
 
     if distributed_bin.exists():
-        shutil.copy2(str(distributed_bin), str(build_target_dir / "jaide-distributed-futhark"))
-        os.chmod(str(build_target_dir / "jaide-distributed-futhark"), 0o755)
+        dist_dst = build_target_dir / "jaide-distributed-futhark"
+        shutil.copy2(str(distributed_bin), str(dist_dst))
+        os.chmod(str(dist_dst), 0o755)
+        _write_fingerprint(dist_dst, source_fp)
         result["distributed_binary_present"] = True
     else:
         result["distributed_binary_present"] = False
         _log(f"FIGYELMEZTETÉS: a disztributált bináris nem épült fel itt: {distributed_bin}")
 
     if inference_bin.exists():
-        shutil.copy2(str(inference_bin), str(build_target_dir / "jaide-inference-server"))
-        os.chmod(str(build_target_dir / "jaide-inference-server"), 0o755)
+        inf_dst = build_target_dir / "jaide-inference-server"
+        shutil.copy2(str(inference_bin), str(inf_dst))
+        os.chmod(str(inf_dst), 0o755)
+        _write_fingerprint(inf_dst, source_fp)
         result["inference_binary_present"] = True
     else:
         result["inference_binary_present"] = False
@@ -865,13 +979,15 @@ def run_gpu_train_and_infer(
     distributed_bin_src = build_source_dir / "jaide-distributed-futhark"
     inference_bin_src = build_source_dir / "jaide-inference-server"
 
+    source_fp = _source_fingerprint(Path(project_dir))
+    result["source_fingerprint"] = source_fp
     if not distributed_bin_src.exists():
-        latest_dist = _find_latest_binary("jaide-distributed-futhark")
+        latest_dist = _find_latest_binary("jaide-distributed-futhark", source_fp)
         if latest_dist:
             distributed_bin_src = latest_dist
 
     if not inference_bin_src.exists():
-        latest_inf = _find_latest_binary("jaide-inference-server")
+        latest_inf = _find_latest_binary("jaide-inference-server", source_fp)
         if latest_inf:
             inference_bin_src = latest_inf
 
@@ -952,6 +1068,10 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_SHUFFLE_TARGET_CONTROL"] = SHUFFLE_TARGET_CONTROL
         train_env["JAIDE_TARGET_SOURCE_FROZEN"] = TARGET_SOURCE_FROZEN
         train_env["JAIDE_SPECTRAL_DEPTH_COMPENSATION"] = SPECTRAL_DEPTH_COMPENSATION
+        train_env["JAIDE_SKIP_KNOWLEDGE_GRAPH"] = SKIP_KNOWLEDGE_GRAPH
+        train_env["JAIDE_GRAPH_CHUNK_SIZE"] = GRAPH_CHUNK_SIZE
+        train_env["JAIDE_INIT_SPECTRAL_ITERS"] = INIT_SPECTRAL_ITERS
+        train_env["JAIDE_FUTHARK_UNIFIED_MEMORY"] = "0"
         vocab_file = Path(CHECKPOINT_PATH)
         if vocab_file.is_file() and vocab_file.stat().st_size > 0:
             train_env["JAIDE_VOCAB_READY"] = "1"
@@ -970,8 +1090,14 @@ def run_gpu_train_and_infer(
         train_env["CUDA_DEVICE_ORDER"] = CUDA_DEVICE_ORDER
         train_env["JAIDE_RELATIONAL_FAST"] = JAIDE_RELATIONAL_FAST
         cache_hasher = hashlib.sha256()
-        cache_hasher.update((PROJECT_MOUNT_PATH / "src/hw/accel/main.fut").read_bytes())
+        for relative in (
+            "src/hw/accel/main.fut",
+            "src/hw/accel/futhark_kernels.fut",
+            "src/hw/accel/futhark_abi_check.c",
+        ):
+            cache_hasher.update((PROJECT_MOUNT_PATH / relative).read_bytes())
         cache_hasher.update(b"futhark-0.26.4-cuda-sm100")
+        cache_hasher.update(source_fp.encode("utf-8"))
         futhark_cache_path = CHECKPOINT_MOUNT_PATH / f"futhark_gpu_cache_{cache_hasher.hexdigest()[:20]}.bin"
         train_env["JAIDE_FUTHARK_CACHE"] = str(futhark_cache_path)
 
@@ -1012,6 +1138,7 @@ def run_gpu_train_and_infer(
         )
         t0 = time.time()
         training_started_ns = time.time_ns()
+        watchdog_error: Optional[str] = None
         try:
             rc_c, out_c, _ = _run_multirank(
                 cmd=training_command,
@@ -1020,13 +1147,21 @@ def run_gpu_train_and_infer(
                 num_gpus=NUM_GPUS,
                 nccl_id_path=nccl_id_path,
                 timeout=72000,
+                init_deadline_sec=INIT_DEADLINE_SEC,
+                idle_watchdog_sec=IDLE_WATCHDOG_SEC,
             )
+        except RuntimeError as exc:
+            rc_c = 1
+            out_c = str(exc)
+            watchdog_error = str(exc)
+            _log(f"Betanítási watchdog: {exc}")
         finally:
             _terminate_process_group(monitor_process)
             monitor_process.wait()
             monitor_file.close()
         phase_c_duration = time.time() - t0
         training_succeeded = rc_c == 0
+        training_failure_class = _classify_training_failure(out_c, watchdog_error is not None, "[Step " in out_c)
         gpu_monitor_text = monitor_path.read_text(encoding="utf-8") if monitor_path.exists() else ""
         gpu_monitor_metrics = _parse_gpu_monitor(gpu_monitor_text)
         _write_report(report_dir, "phase_c_gpu_monitor.csv", gpu_monitor_text)
@@ -1159,6 +1294,9 @@ def run_gpu_train_and_infer(
                 for key, values in timing_samples.items()
             },
             "converged": (len(loss_curve) >= 2 and loss_curve[-1][1] < loss_curve[0][1]) if loss_curve else False,
+            "failure_class": training_failure_class,
+            "watchdog_error": watchdog_error,
+            "reached_step_one": any(step == 1 for step, _ in loss_curve),
         }
         _write_report(report_dir, "phase_c_training.log", out_c)
         _write_report(
@@ -1426,6 +1564,16 @@ def main() -> None:
         raise ValueError("A JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW értéke csak 0, 1, true vagy false lehet")
     if SPECTRAL_INTERVAL <= 0:
         raise ValueError("A JAIDE_BENCH_SPECTRAL_INTERVAL értékének pozitívnak kell lennie")
+    if INIT_DEADLINE_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_INIT_DEADLINE értékének pozitívnak kell lennie")
+    if IDLE_WATCHDOG_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_IDLE_WATCHDOG értékének pozitívnak kell lennie")
+    if SKIP_KNOWLEDGE_GRAPH not in ("0", "1", "true", "false"):
+        raise ValueError("A JAIDE_BENCH_SKIP_KNOWLEDGE_GRAPH értéke csak 0, 1, true vagy false lehet")
+    if int(GRAPH_CHUNK_SIZE) <= 0:
+        raise ValueError("A JAIDE_BENCH_GRAPH_CHUNK_SIZE értékének pozitívnak kell lennie")
+    if int(INIT_SPECTRAL_ITERS) < 0:
+        raise ValueError("A JAIDE_BENCH_INIT_SPECTRAL_ITERS nem lehet negatív")
     for name, raw_value, lower, upper in (
         ("JAIDE_BENCH_GRADIENT_CLIP_NORM", GRADIENT_CLIP_NORM, 0.0, None),
         ("JAIDE_BENCH_SFD_TRUST_RATIO", SFD_TRUST_RATIO, 0.0, 1.0),
