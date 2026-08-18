@@ -6,6 +6,11 @@ const core_memory = @import("../../core/memory.zig");
 
 pub const gpu_enabled: bool = @import("build_options").gpu_acceleration;
 
+// Diagonal affine coupling: each half-split channel uses [scale_w, scale_b]
+// (and the same for translation). This is O(d) parameters and O(d) work per
+// token. The old dense [half][half+1] layout was O(d^2) and blew GPU memory.
+pub const rsf_coupling_width: usize = 2;
+
 pub const AccelError = error{
     FutharkConfigFailed,
     FutharkContextFailed,
@@ -702,31 +707,26 @@ pub const RSFAccelerator = struct {
             1.0 / @sqrt(@as(f32, @floatFromInt(num_layers)))
         else
             1.0;
-        const init_stddev: f32 = depth_scale * 0.25 / @sqrt(@as(f32, @floatFromInt(half)));
+        // Diagonal coupling has fan-in 1, so the stddev is O(1) rather than
+        // 1/sqrt(half). Depth compensation still keeps stacked layers bounded.
+        const init_stddev: f32 = depth_scale * 0.25;
 
         var layers = allocator.alloc(RSFLayer, num_layers) catch return AccelError.AllocationFailed;
         errdefer allocator.free(layers);
 
-        const columns = std.math.add(usize, half, 1) catch return AccelError.InvalidDimensions;
+        const columns = rsf_coupling_width;
         const per_layer = std.math.mul(usize, half, columns) catch return AccelError.InvalidDimensions;
         const stack_count = std.math.mul(usize, num_layers, per_layer) catch return AccelError.InvalidDimensions;
+        const stack_bytes = std.math.mul(usize, stack_count, @sizeOf(f32)) catch return AccelError.InvalidDimensions;
+        std.debug.print(
+            "[RSF] init layers={d} dim={d} half={d} stack_f32_bytes={d}\n",
+            .{ num_layers, model_dim, half, stack_bytes },
+        );
+
         const master_s_data = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
         defer allocator.free(master_s_data);
         const master_t_data = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
         defer allocator.free(master_t_data);
-        const shadow_s_data = allocator.alloc(f16, stack_count) catch return AccelError.AllocationFailed;
-        defer allocator.free(shadow_s_data);
-        const shadow_t_data = allocator.alloc(f16, stack_count) catch return AccelError.AllocationFailed;
-        defer allocator.free(shadow_t_data);
-        const zeros = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
-        defer allocator.free(zeros);
-        @memset(zeros, 0.0);
-
-        var layers_built: usize = 0;
-        errdefer {
-            var index: usize = 0;
-            while (index < layers_built) : (index += 1) layers[index].free(&ctx);
-        }
 
         var layer_index: usize = 0;
         while (layer_index < num_layers) : (layer_index += 1) {
@@ -736,36 +736,48 @@ pub const RSFAccelerator = struct {
             const base = layer_index * per_layer;
             var index: usize = 0;
             while (index < per_layer) : (index += 1) {
-                const value_s = random.floatNorm(f32) * init_stddev;
-                const value_t = random.floatNorm(f32) * init_stddev;
-                master_s_data[base + index] = value_s;
-                master_t_data[base + index] = value_t;
-                shadow_s_data[base + index] = @floatCast(value_s);
-                shadow_t_data[base + index] = @floatCast(value_t);
+                master_s_data[base + index] = random.floatNorm(f32) * init_stddev;
+                master_t_data[base + index] = random.floatNorm(f32) * init_stddev;
             }
             var row: usize = 0;
             while (row < half) : (row += 1) {
-                const bias_index = base + row * columns + half;
+                const bias_index = base + row * columns + 1;
                 master_s_data[bias_index] = 0.0;
                 master_t_data[bias_index] = 0.0;
-                shadow_s_data[bias_index] = 0.0;
-                shadow_t_data[bias_index] = 0.0;
             }
-            var layer_s = try FutharkArray2DF16.newFromFlat(&ctx, shadow_s_data[base .. base + per_layer], half, columns);
-            errdefer layer_s.free(&ctx);
-            const layer_t = try FutharkArray2DF16.newFromFlat(&ctx, shadow_t_data[base .. base + per_layer], half, columns);
-            layers[layer_index] = .{ .weights_s = layer_s, .weights_t = layer_t };
-            layers_built += 1;
+            // Training uses the packed 3D stacks. Per-layer 2D mirrors are
+            // filled lazily; coupling is [half][2] so this is O(d) either way.
+            layers[layer_index] = .{
+                .weights_s = .{ .arr = null, .rows = half, .cols = columns },
+                .weights_t = .{ .arr = null, .rows = half, .cols = columns },
+            };
         }
 
+        std.debug.print("[RSF] uploading master S ({d} bytes)\n", .{stack_bytes});
         var stack_master_s = try FutharkArray3DF32.newFromFlat(&ctx, master_s_data, num_layers, half, columns);
         errdefer stack_master_s.free(&ctx);
+        std.debug.print("[RSF] uploading master T ({d} bytes)\n", .{stack_bytes});
         var stack_master_t = try FutharkArray3DF32.newFromFlat(&ctx, master_t_data, num_layers, half, columns);
         errdefer stack_master_t.free(&ctx);
-        var stack_shadow_s = try FutharkArray3DF16.newFromFlat(&ctx, shadow_s_data, num_layers, half, columns);
+
+        std.debug.print("[RSF] converting master weights to f16 on device\n", .{});
+        var shadow_s_ptr: ?*futhark.struct_futhark_f16_3d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_3d(ctx.ctx, &shadow_s_ptr, stack_master_s.arr) != 0 or shadow_s_ptr == null) {
+            return AccelError.FutharkScaleWeightsFailed;
+        }
+        var stack_shadow_s = FutharkArray3DF16{ .arr = shadow_s_ptr, .dim0 = num_layers, .dim1 = half, .dim2 = columns };
         errdefer stack_shadow_s.free(&ctx);
-        var stack_shadow_t = try FutharkArray3DF16.newFromFlat(&ctx, shadow_t_data, num_layers, half, columns);
+        var shadow_t_ptr: ?*futhark.struct_futhark_f16_3d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_3d(ctx.ctx, &shadow_t_ptr, stack_master_t.arr) != 0 or shadow_t_ptr == null) {
+            return AccelError.FutharkScaleWeightsFailed;
+        }
+        var stack_shadow_t = FutharkArray3DF16{ .arr = shadow_t_ptr, .dim0 = num_layers, .dim1 = half, .dim2 = columns };
         errdefer stack_shadow_t.free(&ctx);
+
+        std.debug.print("[RSF] allocating zeroed optimizer state\n", .{});
+        const zeros = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
+        defer allocator.free(zeros);
+        @memset(zeros, 0.0);
         var momentum_s = try FutharkArray3DF32.newFromFlat(&ctx, zeros, num_layers, half, columns);
         errdefer momentum_s.free(&ctx);
         var momentum_t = try FutharkArray3DF32.newFromFlat(&ctx, zeros, num_layers, half, columns);
@@ -774,6 +786,7 @@ pub const RSFAccelerator = struct {
         errdefer fisher_s.free(&ctx);
         var fisher_t = try FutharkArray3DF32.newFromFlat(&ctx, zeros, num_layers, half, columns);
         errdefer fisher_t.free(&ctx);
+        std.debug.print("[RSF] weight upload complete\n", .{});
 
         const max_batch: usize = 2048;
         const scratch_lengths_buf = allocator.alloc(i64, max_batch) catch return AccelError.AllocationFailed;
@@ -800,7 +813,7 @@ pub const RSFAccelerator = struct {
             .stack_fisher_s = fisher_s,
             .stack_fisher_t = fisher_t,
             .stack_arrays_valid = true,
-            .layers_mirror_valid = true,
+            .layers_mirror_valid = false,
         };
     }
 
@@ -868,7 +881,7 @@ pub const RSFAccelerator = struct {
 
         const l_count = self.layers.len;
         const half = self.model_dim / 2;
-        const cols = half + 1;
+        const cols = rsf_coupling_width;
         const per_layer = std.math.mul(usize, half, cols) catch return AccelError.InvalidDimensions;
         const total = std.math.mul(usize, l_count, per_layer) catch return AccelError.InvalidDimensions;
         const ws_flat = self.allocator.alloc(f16, total) catch return AccelError.AllocationFailed;
@@ -939,7 +952,7 @@ pub const RSFAccelerator = struct {
         if (!self.stack_arrays_valid) return;
         if (self.layers_mirror_valid) return;
         const half = self.model_dim / 2;
-        const cols = half + 1;
+        const cols = rsf_coupling_width;
         const per_layer = std.math.mul(usize, half, cols) catch return AccelError.InvalidDimensions;
         const l_count = self.layers.len;
         const total = std.math.mul(usize, l_count, per_layer) catch return AccelError.InvalidDimensions;
@@ -993,7 +1006,7 @@ pub const RSFAccelerator = struct {
     ) AccelError!void {
         try self.ensureStackPacked();
         const half = self.model_dim / 2;
-        const cols = half + 1;
+        const cols = rsf_coupling_width;
         const per_layer = std.math.mul(usize, half, cols) catch return AccelError.InvalidDimensions;
         const total = std.math.mul(usize, self.num_layers, per_layer) catch return AccelError.InvalidDimensions;
         if (master_weights_s.len != total or master_weights_t.len != total or momentum_s.len != total or momentum_t.len != total or fisher_s.len != total or fisher_t.len != total) return AccelError.InvalidDimensions;
@@ -1242,7 +1255,7 @@ pub const RSFAccelerator = struct {
         }
 
         const half = self.model_dim / 2;
-        const columns = std.math.add(usize, half, 1) catch return AccelError.InvalidDimensions;
+        const columns = rsf_coupling_width;
         return .{
             .stack_gradient_s = .{ .arr = gradient_s, .dim0 = self.num_layers, .dim1 = half, .dim2 = columns },
             .stack_gradient_t = .{ .arr = gradient_t, .dim0 = self.num_layers, .dim1 = half, .dim2 = columns },
@@ -1276,7 +1289,7 @@ pub const RSFAccelerator = struct {
         defer self.ctx.mutex.unlock();
         try self.ensureStackPacked();
         const half = self.model_dim / 2;
-        const columns = std.math.add(usize, half, 1) catch return AccelError.InvalidDimensions;
+        const columns = rsf_coupling_width;
         if (gradient_s.arr == null or gradient_t.arr == null or
             gradient_s.dim0 != self.num_layers or gradient_t.dim0 != self.num_layers or
             gradient_s.dim1 != half or gradient_t.dim1 != half or
@@ -1463,7 +1476,7 @@ pub const RSFAccelerator = struct {
         self.stack_master_weights_s = normalized_s.array;
         self.stack_master_weights_t = normalized_t.array;
         const half = self.model_dim / 2;
-        const cols = half + 1;
+        const cols = rsf_coupling_width;
         self.stack_weights_s = .{ .arr = shadow_s, .dim0 = self.num_layers, .dim1 = half, .dim2 = cols };
         self.stack_weights_t = .{ .arr = shadow_t, .dim0 = self.num_layers, .dim1 = half, .dim2 = cols };
         self.stack_arrays_valid = true;
@@ -1622,19 +1635,21 @@ pub const EmbeddingAccelerator = struct {
         var rng = std.Random.DefaultPrng.init(seed);
         const rnd = rng.random();
         const total = vocab_size * dim;
-        const weight_data = allocator.alloc(f16, total) catch return AccelError.AllocationFailed;
-        defer allocator.free(weight_data);
-        for (weight_data) |*v| {
-            v.* = @floatCast((rnd.float(f32) - 0.5) * 0.02);
-        }
-
-        var weight = try FutharkArray2DF16.newFromFlat(ctx, weight_data, vocab_size, dim);
-        errdefer weight.free(ctx);
+        std.debug.print("[Embedding] init vocab={d} dim={d} master_bytes={d}\n", .{ vocab_size, dim, total * @sizeOf(f32) });
         const master_data = allocator.alloc(f32, total) catch return AccelError.AllocationFailed;
         defer allocator.free(master_data);
-        for (weight_data, master_data) |value, *master| master.* = @floatCast(value);
+        for (master_data) |*master| {
+            master.* = (rnd.float(f32) - 0.5) * 0.02;
+        }
+
         var master_weight = try FutharkArray2DF32.newFromFlat(ctx, master_data, vocab_size, dim);
         errdefer master_weight.free(ctx);
+        var shadow_ptr: ?*futhark.struct_futhark_f16_2d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_2d(ctx.ctx, &shadow_ptr, master_weight.arr) != 0 or shadow_ptr == null) {
+            return AccelError.FutharkArrayNewFailed;
+        }
+        var weight = FutharkArray2DF16{ .arr = shadow_ptr, .rows = vocab_size, .cols = dim };
+        errdefer weight.free(ctx);
         var grad_weight = try FutharkArray2DF32.newZeros(ctx, vocab_size, dim, allocator);
         errdefer grad_weight.free(ctx);
 
@@ -1681,45 +1696,9 @@ pub const EmbeddingAccelerator = struct {
 
     pub fn cloneDevice(self: *Self) AccelError!Self {
         if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
-        const total_elements = try checkedElementCount2(self.vocab_size, self.dim);
-        const flat = self.allocator.alloc(f16, total_elements) catch return AccelError.AllocationFailed;
-        defer self.allocator.free(flat);
-        const rc_values = futhark.futhark_values_f16_2d(self.ctx.ctx, self.weight.arr, @ptrCast(flat.ptr));
-        if (rc_values != 0) return AccelError.FutharkValuesFailed;
-        if (futhark.futhark_context_sync(self.ctx.ctx) != 0) return AccelError.FutharkSyncFailed;
-        var weight_copy = FutharkArray2DF16.newFromFlat(self.ctx, flat, self.vocab_size, self.dim) catch return AccelError.FutharkArrayNewFailed;
-        errdefer weight_copy.free(self.ctx);
         const master_flat = try self.master_weight.valuesFlat(self.ctx, self.allocator);
         defer self.allocator.free(master_flat);
-        var master_copy = try FutharkArray2DF32.newFromFlat(self.ctx, master_flat, self.vocab_size, self.dim);
-        errdefer master_copy.free(self.ctx);
-        var grad_copy = FutharkArray2DF32.newZeros(self.ctx, self.vocab_size, self.dim, self.allocator) catch return AccelError.FutharkArrayNewFailed;
-        errdefer grad_copy.free(self.ctx);
-
-        const max_batch: usize = 2048;
-        const max_seq: usize = 1024;
-        const st = self.allocator.alloc(i64, max_batch * max_seq) catch return AccelError.AllocationFailed;
-        errdefer self.allocator.free(st);
-        const sl = self.allocator.alloc(i64, max_batch) catch return AccelError.AllocationFailed;
-        errdefer self.allocator.free(sl);
-        const sp = self.allocator.alloc(i64, max_seq) catch return AccelError.AllocationFailed;
-
-        return Self{
-            .ctx = self.ctx,
-            .weight = weight_copy,
-            .master_weight = master_copy,
-            .grad_weight = grad_copy,
-            .vocab_size = self.vocab_size,
-            .dim = self.dim,
-            .initialized = true,
-            .allocator = self.allocator,
-            .scratch_token_buf = st,
-            .scratch_token_cap = max_batch * max_seq,
-            .scratch_lengths_buf = sl,
-            .scratch_lengths_cap = max_batch,
-            .scratch_positions_buf = sp,
-            .scratch_positions_cap = max_seq,
-        };
+        return initWithMasterWeights(self.ctx, self.allocator, self.vocab_size, self.dim, master_flat);
     }
 
     pub fn initWithWeights(ctx: *FutharkContext, allocator: std.mem.Allocator, vocab_size: usize, dim: usize, weight_f16: []const f16) AccelError!Self {

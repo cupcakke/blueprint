@@ -32,12 +32,23 @@ pub extern "c" fn futhark_context_config_set_default_group_size(cfg: ?*struct_fu
 pub extern "c" fn futhark_context_config_set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void;
 pub extern "c" fn futhark_context_config_set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
 pub extern "c" fn futhark_context_config_set_cache_file(cfg: ?*struct_futhark_context_config, path: [*:0]const u8) void;
+pub extern "c" fn futhark_context_config_set_logging(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_debugging(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_profiling(cfg: ?*struct_futhark_context_config, flag: c_int) void;
+pub extern "c" fn futhark_context_config_set_unified_memory(cfg: ?*struct_futhark_context_config, flag: c_int) void;
 
 pub fn configureGpuContext(
     cfg: ?*struct_futhark_context_config,
     cache_file: ?[*:0]const u8,
 ) GpuConfigurationError!void {
     if (comptime _build_gpu_enabled) {
+        // Managed memory + Futhark debug logging is what made dim=16384 look
+        // "stuck": every allocation dumped NVRTC flags, then cudaMallocManaged
+        // of the first ~3 GiB stack hung for an hour with no training steps.
+        futhark_context_config_set_logging(cfg, 0);
+        futhark_context_config_set_debugging(cfg, 0);
+        futhark_context_config_set_profiling(cfg, 0);
+        futhark_context_config_set_unified_memory(cfg, 0);
         futhark_context_config_set_device(cfg, "");
         futhark_context_config_set_default_group_size(cfg, gpu_default_group_size);
         futhark_context_config_set_default_num_groups(cfg, gpu_default_num_groups);

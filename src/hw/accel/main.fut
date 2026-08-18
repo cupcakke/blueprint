@@ -15,20 +15,21 @@ let clamp_f16_weight (v: f32) : f32 =
 let mask_embedding_gradient [dim] (gradient: [dim]f32) (valid: bool) : [dim]f32 =
   if valid then gradient else replicate dim 0f32
 
+-- Diagonal affine coupling: [half][2] = [w, bias]. O(d) params/work; invert t then s.
 entry rsf_forward [n][half] (input: [n][half*2]f16)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min: f16) (clip_max: f16) : *[n][half*2]f16 =
   let d = half * 2
   in map (\row ->
     let x1 = map f32.f16 (row[0:half] :> [half]f16)
     let x2 = map f32.f16 (row[half:d] :> [half]f16)
     let scale = map (\j ->
-      let sum = f32.f16 weights_s[j][half] + f32.sum (map2 (\w x -> f32.f16 w * x) (weights_s[j][0:half] :> [half]f16) x2)
+      let sum = f32.f16 weights_s[j][0] * x2[j] + f32.f16 weights_s[j][1]
       let clipped = f32.max (f32.f16 clip_min) (f32.min (f32.f16 clip_max) sum)
       in f32.exp clipped) (iota half)
     let y1 = map2 (*) x1 scale
     let trans = map (\j ->
-      let value = f32.f16 weights_t[j][half] + f32.sum (map2 (\w x -> f32.f16 w * x) (weights_t[j][0:half] :> [half]f16) y1)
+      let value = f32.f16 weights_t[j][0] * y1[j] + f32.f16 weights_t[j][1]
       in if f32.isnan value || f32.isinf value then 0f32 else value) (iota half)
     let y2 = map2 (+) x2 trans
     let output = map (\value -> f16.f32 (clamp_f16_value value)) (y1 ++ y2)
@@ -265,19 +266,17 @@ entry embedding_sum_squares [vocab_size][dim] (source: [vocab_size][dim]f16) : f
 
 let rsf_stack_coupling_row [half]
   (row: [half*2]f32)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min_f32: f32) (clip_max_f32: f32) : [half*2]f32 =
   let x1 = row[0:half] :> [half]f32
   let x2 = row[half:half*2] :> [half]f32
   let scale = map (\d ->
-    let sum = f32.f16 weights_s[d][half]
-              + f32.sum (map2 (\w x -> f32.f16 w * x) (weights_s[d][0:half] :> [half]f16) x2)
+    let sum = f32.f16 weights_s[d][0] * x2[d] + f32.f16 weights_s[d][1]
     let clipped = f32.max clip_min_f32 (f32.min clip_max_f32 sum)
     in f32.exp clipped) (iota half)
   let y1 = map2 (*) x1 scale
   let y2 = map2 (\x2_j j ->
-    let trans = f32.f16 weights_t[j][half]
-                + f32.sum (map2 (\w u -> f32.f16 w * u) (weights_t[j][0:half] :> [half]f16) y1)
+    let trans = f32.f16 weights_t[j][0] * y1[j] + f32.f16 weights_t[j][1]
     in x2_j + (if f32.isnan trans || f32.isinf trans then 0f32 else trans)) x2 (iota half)
   let o1 = map2 (\a b -> (a - b) * oftb_scale_f32) y1 y2
   let o2 = map2 (\a b -> (a + b) * oftb_scale_f32) y1 y2
@@ -285,28 +284,26 @@ let rsf_stack_coupling_row [half]
 
 let rsf_stack_invert_row [half]
   (row: [half*2]f32)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min_f32: f32) (clip_max_f32: f32) : [half*2]f32 =
   let y1p = row[0:half] :> [half]f32
   let y2p = row[half:half*2] :> [half]f32
   let u1 = map2 (\a b -> (a + b) * oftb_scale_f32) y1p y2p
   let u2 = map2 (\a b -> (b - a) * oftb_scale_f32) y1p y2p
   let x2 = map (\d ->
-    let trans = f32.f16 weights_t[d][half]
-                + f32.sum (map2 (\w u -> f32.f16 w * u) (weights_t[d][0:half] :> [half]f16) u1)
+    let trans = f32.f16 weights_t[d][0] * u1[d] + f32.f16 weights_t[d][1]
     let safe_trans = if f32.isnan trans || f32.isinf trans then 0f32 else trans
     in u2[d] - safe_trans) (iota half)
   let x1 = map (\d ->
-    let pre = f32.f16 weights_s[d][half]
-              + f32.sum (map2 (\w x -> f32.f16 w * x) (weights_s[d][0:half] :> [half]f16) x2)
+    let pre = f32.f16 weights_s[d][0] * x2[d] + f32.f16 weights_s[d][1]
     let clipped = f32.max clip_min_f32 (f32.min clip_max_f32 pre)
     in u1[d] / f32.exp clipped) (iota half)
   in (x1 ++ x2) :> [half*2]f32
 
 entry rsf_stack_forward [batch_size][seq_len][half][num_layers]
   (inputs: [batch_size][seq_len][half*2]f16)
-  (weights_s: [num_layers][half][half+1]f16)
-  (weights_t: [num_layers][half][half+1]f16)
+  (weights_s: [num_layers][half][2]f16)
+  (weights_t: [num_layers][half][2]f16)
   (clip_min: f16) (clip_max: f16)
   : *[batch_size][seq_len][half*2]f16 =
   let clip_min_f32 = f32.f16 clip_min
@@ -321,8 +318,8 @@ entry rsf_stack_forward [batch_size][seq_len][half][num_layers]
 
 entry rsf_stack_inverse [batch_size][seq_len][half][num_layers]
   (outputs: [batch_size][seq_len][half*2]f16)
-  (weights_s: [num_layers][half][half+1]f16)
-  (weights_t: [num_layers][half][half+1]f16)
+  (weights_s: [num_layers][half][2]f16)
+  (weights_t: [num_layers][half][2]f16)
   (clip_min: f16) (clip_max: f16)
   : *[batch_size][seq_len][half*2]f16 =
   let clip_min_f32 = f32.f16 clip_min
@@ -341,8 +338,8 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   (targets: [batch_size][seq_len][half*2]f16)
   (originals: [batch_size][seq_len][half*2]f16)
   (lengths: [batch_size]i64)
-  (weights_s: *[num_layers][half][half+1]f16)
-  (weights_t: *[num_layers][half][half+1]f16)
+  (weights_s: *[num_layers][half][2]f16)
+  (weights_t: *[num_layers][half][2]f16)
   (grad_mean: bool)
   (gradient_scale: f32)
   (clip_min: f32)
@@ -350,7 +347,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   (reconstruction_alpha: f32)
   (forward_scale: f32)
   (logdet_weight: f32)
-  : (*[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
+  : (*[num_layers][half][2]f32, *[num_layers][half][2]f32,
      *[batch_size][seq_len][half*2]f16,
      f32, f32, f32) =
   let d2 = half * 2
@@ -377,7 +374,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
       let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
       in 2f32 * safe_diff / gradient_element_divisor) y t) active_final active_targets
   let y_start = map (map f32.f16) active_final
-  let gs_zero = replicate half (replicate (half + 1) 0f32)
+  let gs_zero = replicate half (replicate 2 0f32)
   let (gs_stack, gt_stack, x_stack, g_stack, ld_stack) =
     loop (gs_acc, gt_acc, y_all, g_all, ld_all) =
       (replicate num_layers (copy gs_zero),
@@ -399,15 +396,13 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
         let h1 = map2 (\a b -> (a + b) * oftb_scale_f32) g1p g2p
         let h2 = map2 (\a b -> (b - a) * oftb_scale_f32) g1p g2p
         let dy1_total = map (\j ->
-          h1[j] + f32.sum (map (\d -> h2[d] * f32.f16 wt[d][j]) (iota half))) (iota half)
+          h1[j] + h2[j] * f32.f16 wt[j][0]) (iota half)
         let x2 = map (\d ->
-          let trans = f32.f16 wt[d][half]
-                      + f32.sum (map2 (\w u -> f32.f16 w * u) (wt[d][0:half] :> [half]f16) u1)
+          let trans = f32.f16 wt[d][0] * u1[d] + f32.f16 wt[d][1]
           let safe_trans = if f32.isnan trans || f32.isinf trans then 0f32 else trans
           in u2[d] - safe_trans) (iota half)
         let pre_scale = map (\d ->
-          f32.f16 ws[d][half]
-          + f32.sum (map2 (\w x -> f32.f16 w * x) (ws[d][0:half] :> [half]f16) x2)) (iota half)
+          f32.f16 ws[d][0] * x2[d] + f32.f16 ws[d][1]) (iota half)
         let clipped = map (\p -> f32.max clip_min (f32.min clip_max p)) pre_scale
         let scale = map f32.exp clipped
         let x1 = map2 (/) u1 scale
@@ -416,7 +411,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
         let ds = map3 (\p dt_j u_j ->
           if p >= clip_min && p <= clip_max then dt_j * u_j + ld_shift else 0f32) pre_scale dy1_total u1
         let dx2 = map (\j ->
-          h2[j] + f32.sum (map (\d -> ds[d] * f32.f16 ws[d][j]) (iota half))) (iota half)
+          h2[j] + ds[j] * f32.f16 ws[j][0]) (iota half)
         let y_next = (x1 ++ x2) :> [half*2]f32
         let g_next = (dx1 ++ dx2) :> [half*2]f32
         let ld_tok = f32.sum clipped
@@ -425,12 +420,10 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
       let h2_columns = transpose (map (\(_,h2,_,_,_,_,_) -> h2) per_tok)
       let x2_columns = transpose (map (\(_,_,x2,_,_,_,_) -> x2) per_tok)
       let u1_columns = transpose (map (\(_,_,_,u1,_,_,_) -> u1) per_tok)
-      let gs_l_total = map (\ds_column ->
-        let row_body = map (\x2_column -> f32.sum (map2 (*) ds_column x2_column)) x2_columns
-        in (row_body ++ [f32.sum ds_column]) :> [half+1]f32) ds_columns
-      let gt_l_total = map (\h2_column ->
-        let row_body = map (\u1_column -> f32.sum (map2 (*) h2_column u1_column)) u1_columns
-        in (row_body ++ [f32.sum h2_column]) :> [half+1]f32) h2_columns
+      let gs_l_total = map2 (\ds_column x2_column ->
+        [f32.sum (map2 (*) ds_column x2_column), f32.sum ds_column] :> [2]f32) ds_columns x2_columns
+      let gt_l_total = map2 (\h2_column u1_column ->
+        [f32.sum (map2 (*) h2_column u1_column), f32.sum h2_column] :> [2]f32) h2_columns u1_columns
       let y_next_all = map (\(_,_,_,_,y_next,_,_) -> y_next) per_tok
       let g_next_all = map (\(_,_,_,_,_,g_next,_) -> g_next) per_tok
       let ld_next = map2 (+) ld_all (map (\(_,_,_,_,_,_,ld_tok) -> ld_tok) per_tok)

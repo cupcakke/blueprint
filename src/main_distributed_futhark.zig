@@ -1435,6 +1435,10 @@ pub fn main() !void {
         };
 
         const model_initialization_started = std.time.nanoTimestamp();
+        std.debug.print(
+            "[Rank {d}] Initializing model weights (this is not training yet)\n",
+            .{rank},
+        );
         const initialized_trainer = try DistributedTrainerFuthark.initWithComponents(
             allocator,
             &coordinator,

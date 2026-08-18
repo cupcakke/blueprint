@@ -127,48 +127,48 @@ let rsf_scatter [n] (x: [n]f32) (indices: [n]i64): [n]f32 =
       else x[i]
     )
 
-let rsf_flow [half] (x: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
+let rsf_flow [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   let d = half * 2
   let x1 = x[0:half] :> [half]f32
   let x2 = x[half:d] :> [half]f32
   let scale = tabulate half (\j ->
-    let raw = s_weight[j][half] + reduce (+) 0f32 (map2 (*) (s_weight[j][0:half] :> [half]f32) x2)
+    let raw = s_weight[j][0] * x2[j] + s_weight[j][1]
     let clipped = f32.max clip_min (f32.min clip_max raw)
     in f32.exp clipped
   )
   let y1 = map2 (*) x1 scale
   let trans = tabulate half (\j ->
-    t_weight[j][half] + reduce (+) 0f32 (map2 (*) (t_weight[j][0:half] :> [half]f32) y1)
+    t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let y2 = map2 (+) x2 trans
   in (y1 ++ y2) :> [half*2]f32
 
-let rsf_flow_logdet [half] (x: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, f32) =
+let rsf_flow_logdet [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, f32) =
   let d = half * 2
   let x1 = x[0:half] :> [half]f32
   let x2 = x[half:d] :> [half]f32
   let pre = tabulate half (\j ->
-    s_weight[j][half] + reduce (+) 0f32 (map2 (*) (s_weight[j][0:half] :> [half]f32) x2)
+    s_weight[j][0] * x2[j] + s_weight[j][1]
   )
   let scale = map (\raw -> f32.exp (f32.max clip_min (f32.min clip_max raw))) pre
   let logdet = reduce (+) 0f32 (map (\raw -> f32.max clip_min (f32.min clip_max raw)) pre)
   let y1 = map2 (*) x1 scale
   let trans = tabulate half (\j ->
-    t_weight[j][half] + reduce (+) 0f32 (map2 (*) (t_weight[j][0:half] :> [half]f32) y1)
+    t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let y2 = map2 (+) x2 trans
   in ((y1 ++ y2) :> [half*2]f32, logdet)
 
-let rsf_invert_flow [half] (y: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
+let rsf_invert_flow [half] (y: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   let d = half * 2
   let y1 = y[0:half] :> [half]f32
   let y2 = y[half:d] :> [half]f32
   let trans = tabulate half (\j ->
-    t_weight[j][half] + reduce (+) 0f32 (map2 (*) (t_weight[j][0:half] :> [half]f32) y1)
+    t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let x2 = map2 (-) y2 trans
   let scale = tabulate half (\j ->
-    let raw = s_weight[j][half] + reduce (+) 0f32 (map2 (*) (s_weight[j][0:half] :> [half]f32) x2)
+    let raw = s_weight[j][0] * x2[j] + s_weight[j][1]
     let clipped = f32.max clip_min (f32.min clip_max raw)
     in f32.exp clipped
   )
@@ -178,11 +178,11 @@ let rsf_invert_flow [half] (y: [half*2]f32) (s_weight: [half][half+1]f32) (t_wei
   )
   in (x1 ++ x2) :> [half*2]f32
 
-let rsf_forward_layer [half] (x: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 =
+let rsf_forward_layer [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   let scattered = rsf_scatter x perm_indices
   in rsf_flow scattered s_weight t_weight clip_min clip_max
 
-let rsf_forward_multi [num_layers][half] (x: [half*2]f32) (s_ws: [num_layers][half][half+1]f32) (t_ws: [num_layers][half][half+1]f32) (perms: [num_layers][half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 =
+let rsf_forward_multi [num_layers][half] (x: [half*2]f32) (s_ws: [num_layers][half][2]f32) (t_ws: [num_layers][half][2]f32) (perms: [num_layers][half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   loop acc = x for i < num_layers do
     rsf_forward_layer acc s_ws[i] t_ws[i] perms[i] clip_min clip_max
 
@@ -206,12 +206,12 @@ let rsf_backward_scatter [n] (grad: [n]f32) (indices: [n]i64): [n]f32 =
       if i < half * 2 then base[i] else grad[i]
     )
 
-let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, [half][half+1]f32, [half][half+1]f32) =
+let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, [half][2]f32, [half][2]f32) =
   let d = half * 2
   let x1 = x[0:half] :> [half]f32
   let x2 = x[half:d] :> [half]f32
   let pre_scale = tabulate half (\j ->
-    s_weight[j][half] + reduce (+) 0f32 (map2 (*) (s_weight[j][0:half] :> [half]f32) x2)
+    s_weight[j][0] * x2[j] + s_weight[j][1]
   )
   let scale = map (\ps ->
     let clipped = f32.max clip_min (f32.min clip_max ps)
@@ -221,7 +221,7 @@ let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight:
   let dy1 = grad_out[0:half] :> [half]f32
   let dy2 = grad_out[half:d] :> [half]f32
   let dy1_total = tabulate half (\j ->
-    dy1[j] + reduce (+) 0f32 (tabulate half (\k -> t_weight[k][j] * dy2[k]))
+    dy1[j] + t_weight[j][0] * dy2[j]
   )
   let ds = tabulate half (\j ->
     let in_range = pre_scale[j] >= clip_min && pre_scale[j] <= clip_max
@@ -229,30 +229,30 @@ let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight:
   )
   let dx1 = map2 (*) dy1_total scale
   let dx2 = tabulate half (\j ->
-    dy2[j] + reduce (+) 0f32 (tabulate half (\k -> s_weight[k][j] * ds[k]))
+    dy2[j] + s_weight[j][0] * ds[j]
   )
   let grad_x = (dx1 ++ dx2) :> [half*2]f32
   let grad_ws = tabulate half (\j ->
-    tabulate (half+1) (\k -> if k < half then ds[j] * x2[k] else ds[j])
+    [ds[j] * x2[j], ds[j]]
   )
   let grad_wt = tabulate half (\j ->
-    tabulate (half+1) (\k -> if k < half then dy2[j] * y1[k] else dy2[j])
+    [dy2[j] * y1[j], dy2[j]]
   )
   in (grad_x, grad_ws, grad_wt)
 
 let rsf_backward_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32)
-                            (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32)
+                            (s_weight: [half][2]f32) (t_weight: [half][2]f32)
                             (clip_min: f32) (clip_max: f32) (logdet_weight: f32)
-                            : ([half*2]f32, ([half][half+1]f32, [half][half+1]f32), f32) =
+                            : ([half*2]f32, ([half][2]f32, [half][2]f32), f32) =
   let d = half * 2
   let y1 = y_out[0:half] :> [half]f32
   let y2 = y_out[half:d] :> [half]f32
   let trans = tabulate half (\j ->
-    t_weight[j][half] + reduce (+) 0f32 (map2 (*) (t_weight[j][0:half] :> [half]f32) y1)
+    t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let x2 = map2 (-) y2 trans
   let pre_scale = tabulate half (\j ->
-    s_weight[j][half] + reduce (+) 0f32 (map2 (*) (s_weight[j][0:half] :> [half]f32) x2)
+    s_weight[j][0] * x2[j] + s_weight[j][1]
   )
   let scale = map (\ps ->
     let clipped = f32.max clip_min (f32.min clip_max ps)
@@ -265,7 +265,7 @@ let rsf_backward_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32)
   let dy1 = grad_out[0:half] :> [half]f32
   let dy2 = grad_out[half:d] :> [half]f32
   let dy1_total = tabulate half (\j ->
-    dy1[j] + reduce (+) 0f32 (tabulate half (\k -> t_weight[k][j] * dy2[k]))
+    dy1[j] + t_weight[j][0] * dy2[j]
   )
   let logdet_term = tabulate half (\j ->
     let in_range = pre_scale[j] >= clip_min && pre_scale[j] <= clip_max
@@ -278,27 +278,27 @@ let rsf_backward_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32)
   )
   let dx1 = map2 (*) dy1_total scale
   let dx2 = tabulate half (\j ->
-    dy2[j] + reduce (+) 0f32 (tabulate half (\k -> s_weight[k][j] * ds[k]))
+    dy2[j] + s_weight[j][0] * ds[j]
   )
   let grad_x = (dx1 ++ dx2) :> [half*2]f32
   let grad_ws = tabulate half (\j ->
-    tabulate (half+1) (\k -> if k < half then ds[j] * x2[k] else ds[j])
+    [ds[j] * x2[j], ds[j]]
   )
   let grad_wt = tabulate half (\j ->
-    tabulate (half+1) (\k -> if k < half then dy2[j] * y1[k] else dy2[j])
+    [dy2[j] * y1[j], dy2[j]]
   )
   let logdet = reduce (+) 0f32 (map (\ps ->
     if ps >= clip_min && ps <= clip_max then ps else 0f32) pre_scale)
   let _unused_x1 = x1
   in (grad_x, (copy grad_ws, copy grad_wt), logdet)
 
-let rsf_backward_layer [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32): ([half*2]f32, [half][half+1]f32, [half][half+1]f32) =
+let rsf_backward_layer [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32): ([half*2]f32, [half][2]f32, [half][2]f32) =
   let scattered_x = rsf_scatter x perm_indices
   let (grad_flow, grad_s_w, grad_t_w) = rsf_backward_flow grad_out scattered_x s_weight t_weight clip_min clip_max
   let grad_x = rsf_backward_scatter grad_flow perm_indices
   in (grad_x, grad_s_w, grad_t_w)
 
-let rsf_backward_layer_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32) (s_weight: [half][half+1]f32) (t_weight: [half][half+1]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32) (logdet_weight: f32): ([half*2]f32, [half][half+1]f32, [half][half+1]f32, [half*2]f32, f32) =
+let rsf_backward_layer_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (perm_indices: [half*2]i64) (clip_min: f32) (clip_max: f32) (logdet_weight: f32): ([half*2]f32, [half][2]f32, [half][2]f32, [half*2]f32, f32) =
   let (grad_flow, (grad_s_w, grad_t_w), logdet) = rsf_backward_smr grad_out y_out s_weight t_weight clip_min clip_max logdet_weight
   let grad_x = rsf_backward_scatter grad_flow perm_indices
   let x_reconstructed = rsf_invert_flow y_out s_weight t_weight clip_min clip_max
@@ -534,17 +534,17 @@ entry select_topk [n] (k: i64) (scores: [n]f32): ([]f32, []i64) =
   let safe_k = i64.max 0 k
   in topk safe_k scores (iota n)
 
-entry rsf_forward [half] (x: [half*2]f32) (s_w: [half][half+1]f32) (t_w: [half][half+1]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 = rsf_forward_layer x s_w t_w perm clip_min clip_max
-entry rsf_forward_multilayer [num_layers][half] (x: [half*2]f32) (s_ws: [num_layers][half][half+1]f32) (t_ws: [num_layers][half][half+1]f32) (perms: [num_layers][half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 = rsf_forward_multi x s_ws t_ws perms clip_min clip_max
-entry rsf_backward [half] (grad: [half*2]f32) (x: [half*2]f32) (s_w: [half][half+1]f32) (t_w: [half][half+1]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32): ([]f32, [][]f32, [][]f32) = rsf_backward_layer grad x s_w t_w perm clip_min clip_max
+entry rsf_forward [half] (x: [half*2]f32) (s_w: [half][2]f32) (t_w: [half][2]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 = rsf_forward_layer x s_w t_w perm clip_min clip_max
+entry rsf_forward_multilayer [num_layers][half] (x: [half*2]f32) (s_ws: [num_layers][half][2]f32) (t_ws: [num_layers][half][2]f32) (perms: [num_layers][half*2]i64) (clip_min: f32) (clip_max: f32): [half*2]f32 = rsf_forward_multi x s_ws t_ws perms clip_min clip_max
+entry rsf_backward [half] (grad: [half*2]f32) (x: [half*2]f32) (s_w: [half][2]f32) (t_w: [half][2]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32): ([]f32, [][]f32, [][]f32) = rsf_backward_layer grad x s_w t_w perm clip_min clip_max
 
-entry rsf_backward_smr_logdet [half] (grad: [half*2]f32) (y_out: [half*2]f32) (s_w: [half][half+1]f32) (t_w: [half][half+1]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32) (logdet_weight: f32): ([]f32, [][]f32, [][]f32, []f32, f32) =
+entry rsf_backward_smr_logdet [half] (grad: [half*2]f32) (y_out: [half*2]f32) (s_w: [half][2]f32) (t_w: [half][2]f32) (perm: [half*2]i64) (clip_min: f32) (clip_max: f32) (logdet_weight: f32): ([]f32, [][]f32, [][]f32, []f32, f32) =
   rsf_backward_layer_smr grad y_out s_w t_w perm clip_min clip_max logdet_weight
 
-entry rsf_forward_logdet [half] (x: [half*2]f32) (s_w: [half][half+1]f32) (t_w: [half][half+1]f32) (clip_min: f32) (clip_max: f32): ([]f32, f32) =
+entry rsf_forward_logdet [half] (x: [half*2]f32) (s_w: [half][2]f32) (t_w: [half][2]f32) (clip_min: f32) (clip_max: f32): ([]f32, f32) =
   rsf_flow_logdet x s_w t_w clip_min clip_max
 
-entry rsf_exact_invert [half] (y: [half*2]f32) (s_w: [half][half+1]f32) (t_w: [half][half+1]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
+entry rsf_exact_invert [half] (y: [half*2]f32) (s_w: [half][2]f32) (t_w: [half][2]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   rsf_invert_flow y s_w t_w clip_min clip_max
 
 entry ssi_hash_tokens [m] (tokens: [m]u32): u64 = hash_sequence tokens
@@ -1139,21 +1139,21 @@ entry rgpu_rel_xor (re1: f32) (im1: f32) (re2: f32) (im2: f32): (f32, f32) =
   in (result.re, result.im)
 
 let rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f16)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min: f16) (clip_max: f16)
-  : ([half][half+1]f16, [half][half+1]f16, [n][half*2]f16) =
+  : ([half][2]f16, [half][2]f16, [n][half*2]f16) =
   let per_tok = map2 (\row g_row ->
     let x1 = row[0:half] :> [half]f16
     let x2 = row[half:half*2] :> [half]f16
     let pre_scale = map (\j ->
-      weights_s[j][half] f16.+ f16.sum (map2 (f16.*) (weights_s[j][0:half] :> [half]f16) x2)
+      weights_s[j][0] f16.* x2[j] f16.+ weights_s[j][1]
     ) (iota half)
     let scale = map (\ps -> f16.exp (f16.max clip_min (f16.min clip_max ps))) pre_scale
     let y1 = map2 (f16.*) x1 scale
     let dy1 = g_row[0:half] :> [half]f16
     let dy2 = g_row[half:half*2] :> [half]f16
     let dy1_total = map2 (\dy1_j j ->
-      dy1_j f16.+ f16.sum (map (\k -> weights_t[k][j] f16.* dy2[k]) (iota half))
+      dy1_j f16.+ weights_t[j][0] f16.* dy2[j]
     ) dy1 (iota half)
     let ds = map2 (\j ps ->
       if ps f16.>= clip_min && ps f16.<= clip_max
@@ -1161,10 +1161,7 @@ let rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2
       else f16.i32 0
     ) (iota half) pre_scale
     let dx1 = map2 (f16.*) dy1_total scale
-    let dx2_from_ds = map (\k ->
-      f16.sum (map (\j -> ds[j] f16.* weights_s[j][k]) (iota half))
-    ) (iota half)
-    let dx2 = map2 (f16.+) dy2 dx2_from_ds
+    let dx2 = map2 (f16.+) dy2 (map2 (f16.*) ds (map (\j -> weights_s[j][0]) (iota half)))
     in (ds, x2, dy2, y1, dx1 ++ dx2 :> [half*2]f16)
   ) input grad_output
   let ds_all = map (\(a,_,_,_,_) -> a) per_tok
@@ -1176,36 +1173,34 @@ let rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2
   let x2_t = transpose x2_all
   let dy2_t = transpose dy2_all
   let y1_t = transpose y1_all
-  let acc_ws = map2 (\ds_row bias ->
-    let inner = map (\x2_column -> f16.sum (map2 (f16.*) ds_row x2_column)) x2_t
-    in inner ++ [bias] :> [half+1]f16
-  ) ds_t (map f16.sum ds_t)
-  let acc_wt = map2 (\dy2_row bias ->
-    let inner = map (\y1_column -> f16.sum (map2 (f16.*) dy2_row y1_column)) y1_t
-    in inner ++ [bias] :> [half+1]f16
-  ) dy2_t (map f16.sum dy2_t)
+  let acc_ws = map2 (\ds_row x2_row ->
+    [f16.sum (map2 (f16.*) ds_row x2_row), f16.sum ds_row] :> [2]f16
+  ) ds_t x2_t
+  let acc_wt = map2 (\dy2_row y1_row ->
+    [f16.sum (map2 (f16.*) dy2_row y1_row), f16.sum dy2_row] :> [2]f16
+  ) dy2_t y1_t
   in (acc_ws, acc_wt, g_in)
 
 let rsf_backward_smr_f16 [n][half] (y_output: [n][half*2]f16) (grad_output: [n][half*2]f16)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min: f32) (clip_max: f32) (logdet_weight: f32)
-  : ([half][half+1]f32, [half][half+1]f32, [n][half*2]f32, [n][half*2]f32, f32) =
+  : ([half][2]f32, [half][2]f32, [n][half*2]f32, [n][half*2]f32, f32) =
   let per_tok = map2 (\y_row g_row ->
     let y1 = map f32.f16 (y_row[0:half] :> [half]f16)
     let y2 = map f32.f16 (y_row[half:half*2] :> [half]f16)
     let trans = map (\j ->
-      f32.f16 weights_t[j][half] + f32.sum (map2 (\w v -> f32.f16 w * v) (weights_t[j][0:half] :> [half]f16) y1)
+      f32.f16 weights_t[j][0] * y1[j] + f32.f16 weights_t[j][1]
     ) (iota half)
     let x2 = map2 (-) y2 trans
     let pre_scale = map (\j ->
-      f32.f16 weights_s[j][half] + f32.sum (map2 (\w v -> f32.f16 w * v) (weights_s[j][0:half] :> [half]f16) x2)
+      f32.f16 weights_s[j][0] * x2[j] + f32.f16 weights_s[j][1]
     ) (iota half)
     let scale = map (\ps -> f32.exp (f32.max clip_min (f32.min clip_max ps))) pre_scale
     let x1 = map2 (\y1_v s -> y1_v / f32.max s 1e-30f32) y1 scale
     let dy1 = map f32.f16 (g_row[0:half] :> [half]f16)
     let dy2 = map f32.f16 (g_row[half:half*2] :> [half]f16)
     let dy1_total = map2 (\dy1_j j ->
-      dy1_j + f32.sum (tabulate half (\k -> f32.f16 weights_t[k][j] * dy2[k]))
+      dy1_j + f32.f16 weights_t[j][0] * dy2[j]
     ) dy1 (iota half)
     let ds = map2 (\j ps ->
       let in_range = ps >= clip_min && ps <= clip_max
@@ -1214,10 +1209,7 @@ let rsf_backward_smr_f16 [n][half] (y_output: [n][half*2]f16) (grad_output: [n][
       in base + shift
     ) (iota half) pre_scale
     let dx1 = map2 (*) dy1_total scale
-    let dx2_from_ds = map (\k ->
-      f32.sum (tabulate half (\j -> ds[j] * f32.f16 weights_s[j][k]))
-    ) (iota half)
-    let dx2 = map2 (+) dy2 dx2_from_ds
+    let dx2 = map2 (+) dy2 (map2 (*) ds (map (\j -> f32.f16 weights_s[j][0]) (iota half)))
     let logdet_token = f32.sum (map (\ps ->
       if ps >= clip_min && ps <= clip_max then ps else 0f32) pre_scale)
     in (ds, x2, dy2, y1, x1, dx1 ++ dx2 :> [half*2]f32, logdet_token)
@@ -1233,22 +1225,20 @@ let rsf_backward_smr_f16 [n][half] (y_output: [n][half*2]f16) (grad_output: [n][
   let x2_t = transpose x2_all
   let dy2_t = transpose dy2_all
   let y1_t = transpose y1_all
-  let acc_ws = map2 (\ds_row bias ->
-    let inner = map (\x2_column -> f32.sum (map2 (*) ds_row x2_column)) x2_t
-    in inner ++ [bias] :> [half+1]f32
-  ) ds_t (map f32.sum ds_t)
-  let acc_wt = map2 (\dy2_row bias ->
-    let inner = map (\y1_column -> f32.sum (map2 (*) dy2_row y1_column)) y1_t
-    in inner ++ [bias] :> [half+1]f32
-  ) dy2_t (map f32.sum dy2_t)
+  let acc_ws = map2 (\ds_row x2_row ->
+    [f32.sum (map2 (*) ds_row x2_row), f32.sum ds_row] :> [2]f32
+  ) ds_t x2_t
+  let acc_wt = map2 (\dy2_row y1_row ->
+    [f32.sum (map2 (*) dy2_row y1_row), f32.sum dy2_row] :> [2]f32
+  ) dy2_t y1_t
   let x_recon = map2 (\x1_row x2_row -> x1_row ++ x2_row :> [half*2]f32) x1_all x2_all
   in (acc_ws, acc_wt, g_in, x_recon, f32.sum logdets)
 
 entry rsf_backward_register_logdet_f16 [batch_size][seq_len][half]
   (y_outputs: [batch_size][seq_len][half*2]f16) (grad_outputs: [batch_size][seq_len][half*2]f16)
-  (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
+  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min: f32) (clip_max: f32) (logdet_weight: f32)
-  : ([][half+1]f32, [][half+1]f32, [][half*2]f32, [][half*2]f32, f32) =
+  : ([][2]f32, [][2]f32, [][half*2]f32, [][half*2]f32, f32) =
   let flat_y = flatten y_outputs
   let flat_g = flatten grad_outputs
   let (gws, gwt, gin, xrecon, logdet) = rsf_backward_smr_f16 flat_y flat_g weights_s weights_t clip_min clip_max logdet_weight

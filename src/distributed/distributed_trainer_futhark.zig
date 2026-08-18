@@ -654,6 +654,10 @@ pub const DistributedTrainerFuthark = struct {
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
+        std.debug.print(
+            "[Trainer] allocating RSF stacks dim={d} layers={d} vocab={d}\n",
+            .{ actual_model_dim, num_layers, components.tokenizer.next_token_id },
+        );
         accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
             actual_model_dim,
             num_layers,
@@ -667,9 +671,18 @@ pub const DistributedTrainerFuthark = struct {
             try checkedF32ToF16(config.clip_max),
         );
         if (config.spectral_iterations > 0) {
-            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.spectral_iterations);
+            // Random init already uses a small depth-compensated stddev, so a
+            // single power iteration is enough to bound the spectrum. Coupling
+            // is diagonal O(d); the old dense O(d^2) stack is gone.
+            const init_spectral_iters: usize = @min(config.spectral_iterations, 1);
+            std.debug.print("[Trainer] init spectral normalize iters={d}\n", .{init_spectral_iters});
+            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, init_spectral_iters);
         }
 
+        std.debug.print(
+            "[Trainer] allocating embeddings vocab={d} dim={d}\n",
+            .{ components.tokenizer.next_token_id, actual_model_dim },
+        );
         var gpu_embedding = try accel.EmbeddingAccelerator.init(
             allocator,
             &accelerator_ptr.ctx,
@@ -686,8 +699,10 @@ pub const DistributedTrainerFuthark = struct {
             if (target_source) |*source| source.deinit();
         };
         if (config.target_source_frozen) {
+            std.debug.print("[Trainer] cloning frozen target embeddings\n", .{});
             target_source = try gpu_embedding.cloneDevice();
         }
+        std.debug.print("[Trainer] model buffers ready\n", .{});
 
         const crev_kernel_ptr = try allocator.create(ChaosCoreKernel);
         var crev_kernel_ptr_committed = false;
@@ -2386,7 +2401,7 @@ pub const DistributedTrainerFuthark = struct {
         const clip_max = try checkedF32ToF16(clip_max_f32);
 
         const half = self.model_dim / 2;
-        const columns = try std.math.add(usize, half, 1);
+        const columns = accel.rsf_coupling_width;
         const per_layer = try std.math.mul(usize, half, columns);
         const total_rsf_state = try std.math.mul(usize, per_layer, self.num_layers);
         const saved_master_weights_s = try self.readCheckpointF32Array(reader, total_rsf_state, false);
