@@ -30,6 +30,19 @@ from typing import Any, Dict, List, Tuple
 
 TUPLE_UNPACK_BOUNDARY = (0, 26, 1)
 
+CONTEXT_API = [
+    "pub extern \"c\" fn futhark_context_config_new() ?*struct_futhark_context_config;",
+    "pub extern \"c\" fn futhark_context_config_free"
+    "(cfg: ?*struct_futhark_context_config) void;",
+    "pub extern \"c\" fn futhark_context_new"
+    "(cfg: ?*struct_futhark_context_config) ?*struct_futhark_context;",
+    "pub extern \"c\" fn futhark_context_free(ctx: ?*struct_futhark_context) void;",
+    "pub extern \"c\" fn futhark_context_sync(ctx: ?*struct_futhark_context) c_int;",
+    "pub extern \"c\" fn futhark_context_get_error"
+    "(ctx: ?*struct_futhark_context) ?[*:0]const u8;",
+    "pub extern \"c\" fn futhark_context_clear_caches(ctx: ?*struct_futhark_context) c_int;",
+]
+
 SCALAR_C = {
     "i8": "int8_t",
     "i16": "int16_t",
@@ -193,6 +206,9 @@ def gen_zig(manifest: Dict[str, Any], flatten: bool, source: str) -> str:
         L.append(f"pub const struct_{struct} = opaque {{}};")
     L.append("")
 
+    L.extend(CONTEXT_API)
+    L.append("")
+
     for name in sorted(manifest["entry_points"]):
         entry = manifest["entry_points"][name]
         _, zig_params = entry_signature(manifest, entry, flatten)
@@ -255,7 +271,219 @@ def gen_zig(manifest: Dict[str, Any], flatten: bool, source: str) -> str:
                 )
             L.append("")
 
+    L.extend(gen_zig_wrappers(manifest, flatten))
+    L.extend(gen_zig_deferred(manifest, flatten))
+
     return "\n".join(L) + "\n"
+
+
+def field_type(manifest: Dict[str, Any], t: str) -> str:
+    s = scalar_of(t)
+    if s is not None:
+        return SCALAR_ZIG[s]
+    return f"?*struct_{array_struct(manifest, t)}"
+
+
+def field_zero(manifest: Dict[str, Any], t: str) -> str:
+    s = scalar_of(t)
+    if s is None:
+        return "null"
+    if s == "bool":
+        return "false"
+    if s in ("f32", "f64"):
+        return "0.0"
+    return "0"
+
+
+def gen_zig_deferred(manifest: Dict[str, Any], flatten: bool) -> List[str]:
+    """Emit ABI-independent deferred-projection types for multi-output entries.
+
+    The fused training step wants the array outputs immediately but must not
+    block on the scalar outputs, which are only readable after a context sync.
+    Under the opaque ABI that is expressed by holding the tuple handle and
+    projecting the scalars later; under the flattened ABI the scalars are
+    already written by the entry call.  These types hide that difference so
+    call sites keep one control flow, and keep the tuple handle owned so it is
+    freed exactly once on every path.
+    """
+    L: List[str] = []
+    L.append("// Deferred-projection helpers for multi-output entry points.  `call` performs the")
+    L.append("// entry call and materializes array outputs; `finishScalars` completes scalar")
+    L.append("// outputs after a sync; `abandon` releases any handle without projecting.")
+    L.append("")
+
+    for name in sorted(manifest["entry_points"]):
+        entry = manifest["entry_points"][name]
+        outs = entry["outputs"]
+        inputs = entry["inputs"]
+        if len(outs) <= 1:
+            continue
+
+        tname = tuple_struct_name(outs)
+        arr_idx = [i for i, o in enumerate(outs) if scalar_of(o["type"]) is None]
+        sc_idx = [i for i, o in enumerate(outs) if scalar_of(o["type"]) is not None]
+
+        in_names: List[str] = []
+        in_decls: List[str] = []
+        for i, inp in enumerate(inputs):
+            raw = inp.get("name") or f"in{i}"
+            nm = re.sub(r"[^A-Za-z0-9_]", "_", raw)
+            if nm in {"type", "error", "test", "fn", "const", "var", "align", "export"}:
+                nm = nm + "_"
+            in_names.append(nm)
+            in_decls.append(f"        {nm}: {zig_param(manifest, inp['type'], out=False)},")
+
+        args = ", ".join(in_names)
+        sep = ", " if in_names else ""
+
+        L.append(f"pub const Deferred_{name} = struct {{")
+        for i, out in enumerate(outs):
+            L.append(
+                f"    out{i}: {field_type(manifest, out['type'])} "
+                f"= {field_zero(manifest, out['type'])},"
+            )
+        if not flatten:
+            L.append(f"    tup: ?*struct_futhark_opaque_{tname} = null,")
+        L.append("    scalars_ready: bool = false,")
+        L.append("")
+        L.append("    pub fn call(")
+        L.append("        self: *@This(),")
+        L.append("        ctx: ?*struct_futhark_context,")
+        L.extend(in_decls)
+        L.append("    ) c_int {")
+
+        if flatten:
+            outs_fwd = ", ".join(f"&self.out{i}" for i in range(len(outs)))
+            L.append(f"        const rc = {entry['cfun']}(ctx, {outs_fwd}{sep}{args});")
+            L.append("        if (rc != 0) return rc;")
+            L.append("        self.scalars_ready = true;")
+            L.append("        return 0;")
+        else:
+            L.append(f"        var tup: ?*struct_futhark_opaque_{tname} = null;")
+            L.append(f"        const rc = {entry['cfun']}(ctx, &tup{sep}{args});")
+            L.append("        if (rc != 0) return rc;")
+            L.append("        if (tup == null) return -1;")
+            L.append("        self.tup = tup;")
+            for i in arr_idx:
+                L.append(
+                    f"        const p{i} = futhark_project_opaque_{tname}_{i}"
+                    f"(ctx, &self.out{i}, tup);"
+                )
+                L.append(f"        if (p{i} != 0) {{")
+                L.append("            self.abandon(ctx);")
+                L.append(f"            return p{i};")
+                L.append("        }")
+            L.append("        return 0;")
+        L.append("    }")
+        L.append("")
+
+        L.append("    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {")
+        if flatten or not sc_idx:
+            if flatten:
+                L.append("        _ = ctx;")
+            else:
+                L.append("        self.abandon(ctx);")
+            L.append("        self.scalars_ready = true;")
+            L.append("        return 0;")
+        else:
+            L.append("        if (self.scalars_ready) return 0;")
+            L.append("        const tup = self.tup orelse return 0;")
+            for i in sc_idx:
+                L.append(
+                    f"        const p{i} = futhark_project_opaque_{tname}_{i}"
+                    f"(ctx, &self.out{i}, tup);"
+                )
+                L.append(f"        if (p{i} != 0) {{")
+                L.append("            self.abandon(ctx);")
+                L.append(f"            return p{i};")
+                L.append("        }")
+            L.append("        self.abandon(ctx);")
+            L.append("        self.scalars_ready = true;")
+            L.append("        return 0;")
+        L.append("    }")
+        L.append("")
+
+        L.append("    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {")
+        if flatten:
+            L.append("        _ = self;")
+            L.append("        _ = ctx;")
+        else:
+            L.append("        if (self.tup) |t| {")
+            L.append(f"            _ = futhark_free_opaque_{tname}(ctx, t);")
+            L.append("            self.tup = null;")
+            L.append("        }")
+        L.append("    }")
+        L.append("};")
+        L.append("")
+
+    return L
+
+
+def gen_zig_wrappers(manifest: Dict[str, Any], flatten: bool) -> List[str]:
+    """Emit ABI-independent `call_<entry>` wrappers.
+
+    Callers use these instead of the raw externs so that the same Zig source
+    links against either tuple convention.  Under the flattened ABI the
+    wrapper forwards directly; under the opaque ABI it receives the tuple,
+    projects each component out and frees the tuple handle.  Projection
+    failures free the handle before returning, so no leak is possible on any
+    path.
+    """
+    L: List[str] = []
+    L.append("// ABI-independent entry point wrappers.  Call these, not the raw externs:")
+    L.append("// they present one signature across both Futhark tuple conventions.")
+    L.append("")
+
+    for name in sorted(manifest["entry_points"]):
+        entry = manifest["entry_points"][name]
+        outs = entry["outputs"]
+        inputs = entry["inputs"]
+
+        flat_params: List[str] = []
+        for i, out in enumerate(outs):
+            flat_params.append(f"    out{i}: {zig_param(manifest, out['type'], out=True)},")
+
+        in_names: List[str] = []
+        for i, inp in enumerate(inputs):
+            raw = inp.get("name") or f"in{i}"
+            nm = re.sub(r"[^A-Za-z0-9_]", "_", raw)
+            if nm in {"type", "error", "test", "fn", "const", "var", "align", "export"}:
+                nm = nm + "_"
+            in_names.append(nm)
+            flat_params.append(f"    {nm}: {zig_param(manifest, inp['type'], out=False)},")
+
+        L.append(f"pub inline fn call_{name}(")
+        L.append("    ctx: ?*struct_futhark_context,")
+        L.extend(flat_params)
+        L.append(") c_int {")
+
+        args = ", ".join(in_names)
+        sep = ", " if in_names else ""
+
+        if len(outs) <= 1 or flatten:
+            outs_fwd = ", ".join(f"out{i}" for i in range(len(outs)))
+            osep = ", " if outs_fwd else ""
+            L.append(f"    return {entry['cfun']}(ctx{osep}{outs_fwd}{sep}{args});")
+        else:
+            tname = tuple_struct_name(outs)
+            L.append(f"    var tup: ?*struct_futhark_opaque_{tname} = null;")
+            L.append(f"    const rc = {entry['cfun']}(ctx, &tup{sep}{args});")
+            L.append("    if (rc != 0) return rc;")
+            L.append("    if (tup == null) return -1;")
+            for i in range(len(outs)):
+                L.append(
+                    f"    const p{i} = futhark_project_opaque_{tname}_{i}(ctx, out{i}, tup);"
+                )
+                L.append(f"    if (p{i} != 0) {{")
+                L.append(f"        _ = futhark_free_opaque_{tname}(ctx, tup);")
+                L.append(f"        return p{i};")
+                L.append("    }")
+            L.append(f"    return futhark_free_opaque_{tname}(ctx, tup);")
+
+        L.append("}")
+        L.append("")
+
+    return L
 
 
 def gen_c_check(manifest: Dict[str, Any], flatten: bool, header: str, source: str) -> str:

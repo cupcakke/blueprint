@@ -17,6 +17,14 @@ pub const struct_futhark_f32_3d = opaque {};
 pub const struct_futhark_i64_1d = opaque {};
 pub const struct_futhark_u64_1d = opaque {};
 
+pub extern "c" fn futhark_context_config_new() ?*struct_futhark_context_config;
+pub extern "c" fn futhark_context_config_free(cfg: ?*struct_futhark_context_config) void;
+pub extern "c" fn futhark_context_new(cfg: ?*struct_futhark_context_config) ?*struct_futhark_context;
+pub extern "c" fn futhark_context_free(ctx: ?*struct_futhark_context) void;
+pub extern "c" fn futhark_context_sync(ctx: ?*struct_futhark_context) c_int;
+pub extern "c" fn futhark_context_get_error(ctx: ?*struct_futhark_context) ?[*:0]const u8;
+pub extern "c" fn futhark_context_clear_caches(ctx: ?*struct_futhark_context) c_int;
+
 pub extern "c" fn futhark_entry_clip_matrix_global_norm_f32(
     ctx: ?*struct_futhark_context,
     out0: ?*?*struct_futhark_f32_2d,
@@ -241,4 +249,450 @@ pub extern "c" fn futhark_free_u64_1d(ctx: ?*struct_futhark_context, arr: ?*stru
 pub extern "c" fn futhark_values_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d, data: ?[*]u64) c_int;
 pub extern "c" fn futhark_shape_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d) ?[*]const i64;
 pub extern "c" fn futhark_values_raw_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d) ?*anyopaque;
+
+// ABI-independent entry point wrappers.  Call these, not the raw externs:
+// they present one signature across both Futhark tuple conventions.
+
+pub inline fn call_clip_matrix_global_norm_f32(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    values: ?*const struct_futhark_f32_2d,
+    clip_norm: f32,
+) c_int {
+    return futhark_entry_clip_matrix_global_norm_f32(ctx, out0, values, clip_norm);
+}
+
+pub inline fn call_embedding_backward_padded(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    tokens: ?*const struct_futhark_i64_1d,
+    lengths: ?*const struct_futhark_i64_1d,
+    grad_output: ?*const struct_futhark_f16_3d,
+    grad_weight: ?*const struct_futhark_f32_2d,
+) c_int {
+    return futhark_entry_embedding_backward_padded(ctx, out0, tokens, lengths, grad_output, grad_weight);
+}
+
+pub inline fn call_embedding_forward_padded(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_3d,
+    tokens: ?*const struct_futhark_i64_1d,
+    lengths: ?*const struct_futhark_i64_1d,
+    positions: ?*const struct_futhark_i64_1d,
+    weight: ?*const struct_futhark_f16_2d,
+) c_int {
+    return futhark_entry_embedding_forward_padded(ctx, out0, tokens, lengths, positions, weight);
+}
+
+pub inline fn call_embedding_spectral_normalize(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    out1: ?*?*struct_futhark_f32_1d,
+    out2: ?*?*struct_futhark_f32_1d,
+    out3: ?*f32,
+    out4: ?*f32,
+    weight: ?*const struct_futhark_f32_2d,
+    u: ?*const struct_futhark_f32_1d,
+    v: ?*const struct_futhark_f32_1d,
+    power_iters: i64,
+    target: f32,
+) c_int {
+    return futhark_entry_embedding_spectral_normalize(ctx, out0, out1, out2, out3, out4, weight, u, v, power_iters, target);
+}
+
+pub inline fn call_embedding_sum_squares(
+    ctx: ?*struct_futhark_context,
+    out0: ?*f32,
+    source: ?*const struct_futhark_f16_2d,
+) c_int {
+    return futhark_entry_embedding_sum_squares(ctx, out0, source);
+}
+
+pub inline fn call_embedding_update_sfd_master(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    out1: ?*?*struct_futhark_f32_2d,
+    out2: ?*?*struct_futhark_f32_2d,
+    master_weight: ?*const struct_futhark_f32_2d,
+    grad_weight: ?*const struct_futhark_f32_2d,
+    momentum_state: ?*const struct_futhark_f32_2d,
+    fisher_state: ?*const struct_futhark_f32_2d,
+    learning_rate: f32,
+    momentum_beta: f32,
+    fisher_gamma: f32,
+    optimizer_step: i64,
+    epsilon: f32,
+    trust_ratio: f32,
+    weight_floor: f32,
+) c_int {
+    return futhark_entry_embedding_update_sfd_master(ctx, out0, out1, out2, master_weight, grad_weight, momentum_state, fisher_state, learning_rate, momentum_beta, fisher_gamma, optimizer_step, epsilon, trust_ratio, weight_floor);
+}
+
+pub inline fn call_graph_batch_encode(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_u64_1d,
+    out1: ?*?*struct_futhark_f32_1d,
+    out2: ?*?*struct_futhark_f32_1d,
+    out3: ?*?*struct_futhark_f32_1d,
+    out4: ?*?*struct_futhark_f32_1d,
+    out5: ?*?*struct_futhark_i64_1d,
+    out6: ?*?*struct_futhark_i64_1d,
+    data_hashes: ?*const struct_futhark_u64_1d,
+    _seed: u64,
+) c_int {
+    return futhark_entry_graph_batch_encode(ctx, out0, out1, out2, out3, out4, out5, out6, data_hashes, _seed);
+}
+
+pub inline fn call_master_weights_to_f16_2d(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_2d,
+    weights: ?*const struct_futhark_f32_2d,
+) c_int {
+    return futhark_entry_master_weights_to_f16_2d(ctx, out0, weights);
+}
+
+pub inline fn call_master_weights_to_f16_3d(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_3d,
+    weights: ?*const struct_futhark_f32_3d,
+) c_int {
+    return futhark_entry_master_weights_to_f16_3d(ctx, out0, weights);
+}
+
+pub inline fn call_matmul(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    a: ?*const struct_futhark_f32_2d,
+    b: ?*const struct_futhark_f32_2d,
+) c_int {
+    return futhark_entry_matmul(ctx, out0, a, b);
+}
+
+pub inline fn call_rsf_forward(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_2d,
+    input: ?*const struct_futhark_f16_2d,
+    weights_s: ?*const struct_futhark_f16_2d,
+    weights_t: ?*const struct_futhark_f16_2d,
+    clip_min: u16,
+    clip_max: u16,
+) c_int {
+    return futhark_entry_rsf_forward(ctx, out0, input, weights_s, weights_t, clip_min, clip_max);
+}
+
+pub inline fn call_rsf_stack_backward_gradients_fused(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_3d,
+    out1: ?*?*struct_futhark_f32_3d,
+    out2: ?*?*struct_futhark_f16_3d,
+    out3: ?*f32,
+    out4: ?*f32,
+    out5: ?*f32,
+    final_outputs: ?*const struct_futhark_f16_3d,
+    targets: ?*const struct_futhark_f16_3d,
+    originals: ?*const struct_futhark_f16_3d,
+    lengths: ?*const struct_futhark_i64_1d,
+    weights_s: ?*const struct_futhark_f16_3d,
+    weights_t: ?*const struct_futhark_f16_3d,
+    grad_mean: bool,
+    gradient_scale: f32,
+    clip_min: f32,
+    clip_max: f32,
+    reconstruction_alpha: f32,
+    forward_scale: f32,
+    logdet_weight: f32,
+) c_int {
+    return futhark_entry_rsf_stack_backward_gradients_fused(ctx, out0, out1, out2, out3, out4, out5, final_outputs, targets, originals, lengths, weights_s, weights_t, grad_mean, gradient_scale, clip_min, clip_max, reconstruction_alpha, forward_scale, logdet_weight);
+}
+
+pub inline fn call_rsf_stack_forward(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_3d,
+    inputs: ?*const struct_futhark_f16_3d,
+    weights_s: ?*const struct_futhark_f16_3d,
+    weights_t: ?*const struct_futhark_f16_3d,
+    clip_min: u16,
+    clip_max: u16,
+) c_int {
+    return futhark_entry_rsf_stack_forward(ctx, out0, inputs, weights_s, weights_t, clip_min, clip_max);
+}
+
+pub inline fn call_rsf_stack_inverse(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f16_3d,
+    outputs: ?*const struct_futhark_f16_3d,
+    weights_s: ?*const struct_futhark_f16_3d,
+    weights_t: ?*const struct_futhark_f16_3d,
+    clip_min: u16,
+    clip_max: u16,
+) c_int {
+    return futhark_entry_rsf_stack_inverse(ctx, out0, outputs, weights_s, weights_t, clip_min, clip_max);
+}
+
+pub inline fn call_scale_matrix_f32(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_2d,
+    values: ?*const struct_futhark_f32_2d,
+    scale_factor: f32,
+) c_int {
+    return futhark_entry_scale_matrix_f32(ctx, out0, values, scale_factor);
+}
+
+pub inline fn call_stack_spectral_normalize(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_3d,
+    out1: ?*f32,
+    out2: ?*f32,
+    weights: ?*const struct_futhark_f32_3d,
+    target: f32,
+    power_iters: i64,
+) c_int {
+    return futhark_entry_stack_spectral_normalize(ctx, out0, out1, out2, weights, target, power_iters);
+}
+
+pub inline fn call_stack_update_sfd_master(
+    ctx: ?*struct_futhark_context,
+    out0: ?*?*struct_futhark_f32_3d,
+    out1: ?*?*struct_futhark_f32_3d,
+    out2: ?*?*struct_futhark_f32_3d,
+    master_weights: ?*const struct_futhark_f32_3d,
+    gradients: ?*const struct_futhark_f32_3d,
+    momentum_state: ?*const struct_futhark_f32_3d,
+    fisher_state: ?*const struct_futhark_f32_3d,
+    learning_rate: f32,
+    momentum_beta: f32,
+    fisher_gamma: f32,
+    optimizer_step: i64,
+    epsilon: f32,
+    trust_ratio: f32,
+    weight_floor: f32,
+) c_int {
+    return futhark_entry_stack_update_sfd_master(ctx, out0, out1, out2, master_weights, gradients, momentum_state, fisher_state, learning_rate, momentum_beta, fisher_gamma, optimizer_step, epsilon, trust_ratio, weight_floor);
+}
+
+// Deferred-projection helpers for multi-output entry points.  `call` performs the
+// entry call and materializes array outputs; `finishScalars` completes scalar
+// outputs after a sync; `abandon` releases any handle without projecting.
+
+pub const Deferred_embedding_spectral_normalize = struct {
+    out0: ?*struct_futhark_f32_2d = null,
+    out1: ?*struct_futhark_f32_1d = null,
+    out2: ?*struct_futhark_f32_1d = null,
+    out3: f32 = 0.0,
+    out4: f32 = 0.0,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        weight: ?*const struct_futhark_f32_2d,
+        u: ?*const struct_futhark_f32_1d,
+        v: ?*const struct_futhark_f32_1d,
+        power_iters: i64,
+        target: f32,
+    ) c_int {
+        const rc = futhark_entry_embedding_spectral_normalize(ctx, &self.out0, &self.out1, &self.out2, &self.out3, &self.out4, weight, u, v, power_iters, target);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
+
+pub const Deferred_embedding_update_sfd_master = struct {
+    out0: ?*struct_futhark_f32_2d = null,
+    out1: ?*struct_futhark_f32_2d = null,
+    out2: ?*struct_futhark_f32_2d = null,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        master_weight: ?*const struct_futhark_f32_2d,
+        grad_weight: ?*const struct_futhark_f32_2d,
+        momentum_state: ?*const struct_futhark_f32_2d,
+        fisher_state: ?*const struct_futhark_f32_2d,
+        learning_rate: f32,
+        momentum_beta: f32,
+        fisher_gamma: f32,
+        optimizer_step: i64,
+        epsilon: f32,
+        trust_ratio: f32,
+        weight_floor: f32,
+    ) c_int {
+        const rc = futhark_entry_embedding_update_sfd_master(ctx, &self.out0, &self.out1, &self.out2, master_weight, grad_weight, momentum_state, fisher_state, learning_rate, momentum_beta, fisher_gamma, optimizer_step, epsilon, trust_ratio, weight_floor);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
+
+pub const Deferred_graph_batch_encode = struct {
+    out0: ?*struct_futhark_u64_1d = null,
+    out1: ?*struct_futhark_f32_1d = null,
+    out2: ?*struct_futhark_f32_1d = null,
+    out3: ?*struct_futhark_f32_1d = null,
+    out4: ?*struct_futhark_f32_1d = null,
+    out5: ?*struct_futhark_i64_1d = null,
+    out6: ?*struct_futhark_i64_1d = null,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        data_hashes: ?*const struct_futhark_u64_1d,
+        _seed: u64,
+    ) c_int {
+        const rc = futhark_entry_graph_batch_encode(ctx, &self.out0, &self.out1, &self.out2, &self.out3, &self.out4, &self.out5, &self.out6, data_hashes, _seed);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
+
+pub const Deferred_rsf_stack_backward_gradients_fused = struct {
+    out0: ?*struct_futhark_f32_3d = null,
+    out1: ?*struct_futhark_f32_3d = null,
+    out2: ?*struct_futhark_f16_3d = null,
+    out3: f32 = 0.0,
+    out4: f32 = 0.0,
+    out5: f32 = 0.0,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        final_outputs: ?*const struct_futhark_f16_3d,
+        targets: ?*const struct_futhark_f16_3d,
+        originals: ?*const struct_futhark_f16_3d,
+        lengths: ?*const struct_futhark_i64_1d,
+        weights_s: ?*const struct_futhark_f16_3d,
+        weights_t: ?*const struct_futhark_f16_3d,
+        grad_mean: bool,
+        gradient_scale: f32,
+        clip_min: f32,
+        clip_max: f32,
+        reconstruction_alpha: f32,
+        forward_scale: f32,
+        logdet_weight: f32,
+    ) c_int {
+        const rc = futhark_entry_rsf_stack_backward_gradients_fused(ctx, &self.out0, &self.out1, &self.out2, &self.out3, &self.out4, &self.out5, final_outputs, targets, originals, lengths, weights_s, weights_t, grad_mean, gradient_scale, clip_min, clip_max, reconstruction_alpha, forward_scale, logdet_weight);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
+
+pub const Deferred_stack_spectral_normalize = struct {
+    out0: ?*struct_futhark_f32_3d = null,
+    out1: f32 = 0.0,
+    out2: f32 = 0.0,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        weights: ?*const struct_futhark_f32_3d,
+        target: f32,
+        power_iters: i64,
+    ) c_int {
+        const rc = futhark_entry_stack_spectral_normalize(ctx, &self.out0, &self.out1, &self.out2, weights, target, power_iters);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
+
+pub const Deferred_stack_update_sfd_master = struct {
+    out0: ?*struct_futhark_f32_3d = null,
+    out1: ?*struct_futhark_f32_3d = null,
+    out2: ?*struct_futhark_f32_3d = null,
+    scalars_ready: bool = false,
+
+    pub fn call(
+        self: *@This(),
+        ctx: ?*struct_futhark_context,
+        master_weights: ?*const struct_futhark_f32_3d,
+        gradients: ?*const struct_futhark_f32_3d,
+        momentum_state: ?*const struct_futhark_f32_3d,
+        fisher_state: ?*const struct_futhark_f32_3d,
+        learning_rate: f32,
+        momentum_beta: f32,
+        fisher_gamma: f32,
+        optimizer_step: i64,
+        epsilon: f32,
+        trust_ratio: f32,
+        weight_floor: f32,
+    ) c_int {
+        const rc = futhark_entry_stack_update_sfd_master(ctx, &self.out0, &self.out1, &self.out2, master_weights, gradients, momentum_state, fisher_state, learning_rate, momentum_beta, fisher_gamma, optimizer_step, epsilon, trust_ratio, weight_floor);
+        if (rc != 0) return rc;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn finishScalars(self: *@This(), ctx: ?*struct_futhark_context) c_int {
+        _ = ctx;
+        self.scalars_ready = true;
+        return 0;
+    }
+
+    pub fn abandon(self: *@This(), ctx: ?*struct_futhark_context) void {
+        _ = self;
+        _ = ctx;
+    }
+};
 

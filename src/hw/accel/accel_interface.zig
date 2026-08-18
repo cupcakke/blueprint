@@ -597,7 +597,7 @@ pub const FusedStepResult = struct {
     stack_gradient_s: FutharkArray3DF32,
     stack_gradient_t: FutharkArray3DF32,
     input_delta: FutharkArray3DF16,
-    pending: ?*futhark.struct_futhark_opaque_tup6_fused_stack_gradients,
+    pending: ?futhark.abi.Deferred_rsf_stack_backward_gradients_fused,
     finalized: bool,
     scalars: FusedStepScalars,
 
@@ -614,20 +614,17 @@ pub const FusedStepResult = struct {
         if (self.finalized) return self.scalars;
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
-        const tup = self.pending orelse {
+        if (self.pending == null) {
             self.finalized = true;
             return self.scalars;
-        };
+        }
         if (futhark.futhark_context_sync(ctx.ctx) != 0) return AccelError.FutharkSyncFailed;
-        var loss_out: f32 = 0.0;
-        var recon_out: f32 = 0.0;
-        var logdet_out: f32 = 0.0;
-        const p3 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_3(ctx.ctx, &loss_out, tup);
-        const p4 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_4(ctx.ctx, &recon_out, tup);
-        const p5 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_5(ctx.ctx, &logdet_out, tup);
-        _ = futhark.futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(ctx.ctx, tup);
+        const projection = self.pending.?.finishScalars(ctx.ctx);
+        const loss_out = self.pending.?.out3;
+        const recon_out = self.pending.?.out4;
+        const logdet_out = self.pending.?.out5;
         self.pending = null;
-        if (p3 != 0 or p4 != 0 or p5 != 0) return AccelError.FutharkTrainingStepFailed;
+        if (projection != 0) return AccelError.FutharkTrainingStepFailed;
         if (!std.math.isFinite(loss_out) or !std.math.isFinite(recon_out) or !std.math.isFinite(logdet_out)) return AccelError.FutharkTrainingStepFailed;
         self.scalars = .{ .loss = loss_out, .reconstruction_loss = recon_out, .logdet_mean = logdet_out };
         self.finalized = true;
@@ -640,8 +637,8 @@ pub const FusedStepResult = struct {
         self.stack_gradient_t.free(ctx);
         self.stack_gradient_s.free(ctx);
         self.input_delta.free(ctx);
-        if (self.pending) |tup| {
-            _ = futhark.futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(ctx.ctx, tup);
+        if (self.pending != null) {
+            self.pending.?.abandon(ctx.ctx);
             self.pending = null;
         }
     }
@@ -1185,7 +1182,7 @@ pub const RSFAccelerator = struct {
         const clip_max_f32: f32 = @floatCast(self.clip_max);
 
         var final_outputs: ?*futhark.struct_futhark_f16_3d = null;
-        var out_tuple: ?*futhark.struct_futhark_opaque_tup6_fused_stack_gradients = null;
+        var fused: futhark.abi.Deferred_rsf_stack_backward_gradients_fused = .{};
         const forward_result = futhark.futhark_entry_rsf_stack_forward(
             self.ctx.ctx,
             &final_outputs,
@@ -1200,9 +1197,8 @@ pub const RSFAccelerator = struct {
             return AccelError.FutharkForwardFailed;
         }
 
-        const backward_result = futhark.futhark_entry_rsf_stack_backward_gradients_fused(
+        const backward_result = fused.call(
             self.ctx.ctx,
-            &out_tuple,
             final_outputs,
             targets.arr,
             inputs.arr,
@@ -1218,26 +1214,22 @@ pub const RSFAccelerator = struct {
             logdet_weight,
         );
         _ = futhark.futhark_free_f16_3d(self.ctx.ctx, final_outputs);
-        if (backward_result != 0 or out_tuple == null) {
-            if (out_tuple) |tuple| _ = futhark.futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(self.ctx.ctx, tuple);
+        if (backward_result != 0) {
+            fused.abandon(self.ctx.ctx);
             const message = futhark.futhark_context_get_error(self.ctx.ctx);
             defer freeFutharkError(message);
             if (message) |text| std.debug.print("[Futhark rsf_stack_backward_gradients_fused error] {s}\n", .{std.mem.span(text)});
             return AccelError.FutharkTrainingStepFailed;
         }
 
-        const tuple = out_tuple.?;
-        var gradient_s: ?*futhark.struct_futhark_f32_3d = null;
-        var gradient_t: ?*futhark.struct_futhark_f32_3d = null;
-        var delta: ?*futhark.struct_futhark_f16_3d = null;
-        const projection_s = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_0(self.ctx.ctx, &gradient_s, tuple);
-        const projection_t = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_1(self.ctx.ctx, &gradient_t, tuple);
-        const projection_delta = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_2(self.ctx.ctx, &delta, tuple);
-        if (projection_s != 0 or projection_t != 0 or projection_delta != 0 or gradient_s == null or gradient_t == null or delta == null) {
+        const gradient_s = fused.out0;
+        const gradient_t = fused.out1;
+        const delta = fused.out2;
+        if (gradient_s == null or gradient_t == null or delta == null) {
             if (gradient_s) |array| _ = futhark.futhark_free_f32_3d(self.ctx.ctx, array);
             if (gradient_t) |array| _ = futhark.futhark_free_f32_3d(self.ctx.ctx, array);
             if (delta) |array| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, array);
-            _ = futhark.futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(self.ctx.ctx, tuple);
+            fused.abandon(self.ctx.ctx);
             return AccelError.FutharkTrainingStepFailed;
         }
 
@@ -1247,7 +1239,7 @@ pub const RSFAccelerator = struct {
             .stack_gradient_s = .{ .arr = gradient_s, .dim0 = self.num_layers, .dim1 = half, .dim2 = columns },
             .stack_gradient_t = .{ .arr = gradient_t, .dim0 = self.num_layers, .dim1 = half, .dim2 = columns },
             .input_delta = .{ .arr = delta, .dim0 = inputs.dim0, .dim1 = inputs.dim1, .dim2 = inputs.dim2 },
-            .pending = out_tuple,
+            .pending = fused,
             .finalized = false,
             .scalars = .{ .loss = 0.0, .reconstruction_loss = 0.0, .logdet_mean = 0.0 },
         };
@@ -1290,17 +1282,6 @@ pub const RSFAccelerator = struct {
         const fisher_t = self.stack_fisher_t orelse return AccelError.NullPointer;
         const next_step: i64 = @intCast(@min(self.optimizer_step +| 1, @as(u64, std.math.maxInt(i64))));
 
-        var tuple_s: ?*futhark.struct_futhark_opaque_tup3_stack_sfd = null;
-        var tuple_t: ?*futhark.struct_futhark_opaque_tup3_stack_sfd = null;
-        if (futhark.futhark_entry_stack_update_sfd_master(self.ctx.ctx, &tuple_s, master_s.arr, gradient_s.arr, momentum_s.arr, fisher_s.arr, learning_rate, momentum_beta, fisher_gamma, next_step, epsilon, trust_ratio, weight_floor) != 0 or tuple_s == null) return AccelError.FutharkTrainingStepFailed;
-        defer if (tuple_s) |tuple| {
-            _ = futhark.futhark_free_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32(self.ctx.ctx, tuple);
-        };
-        if (futhark.futhark_entry_stack_update_sfd_master(self.ctx.ctx, &tuple_t, master_t.arr, gradient_t.arr, momentum_t.arr, fisher_t.arr, learning_rate, momentum_beta, fisher_gamma, next_step, epsilon, trust_ratio, weight_floor) != 0 or tuple_t == null) return AccelError.FutharkTrainingStepFailed;
-        defer if (tuple_t) |tuple| {
-            _ = futhark.futhark_free_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32(self.ctx.ctx, tuple);
-        };
-
         var new_master_s: ?*futhark.struct_futhark_f32_3d = null;
         var new_master_t: ?*futhark.struct_futhark_f32_3d = null;
         var new_momentum_s: ?*futhark.struct_futhark_f32_3d = null;
@@ -1327,12 +1308,8 @@ pub const RSFAccelerator = struct {
         };
 
         const projections = [_]c_int{
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_0(self.ctx.ctx, &new_master_s, tuple_s.?),
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_1(self.ctx.ctx, &new_momentum_s, tuple_s.?),
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_2(self.ctx.ctx, &new_fisher_s, tuple_s.?),
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_0(self.ctx.ctx, &new_master_t, tuple_t.?),
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_1(self.ctx.ctx, &new_momentum_t, tuple_t.?),
-            futhark.futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_2(self.ctx.ctx, &new_fisher_t, tuple_t.?),
+            futhark.abi.call_stack_update_sfd_master(self.ctx.ctx, &new_master_s, &new_momentum_s, &new_fisher_s, master_s.arr, gradient_s.arr, momentum_s.arr, fisher_s.arr, learning_rate, momentum_beta, fisher_gamma, next_step, epsilon, trust_ratio, weight_floor),
+            futhark.abi.call_stack_update_sfd_master(self.ctx.ctx, &new_master_t, &new_momentum_t, &new_fisher_t, master_t.arr, gradient_t.arr, momentum_t.arr, fisher_t.arr, learning_rate, momentum_beta, fisher_gamma, next_step, epsilon, trust_ratio, weight_floor),
         };
         for (projections) |projection| if (projection != 0) return AccelError.FutharkTrainingStepFailed;
         if (new_master_s == null or new_master_t == null or new_momentum_s == null or new_momentum_t == null or new_fisher_s == null or new_fisher_t == null) return AccelError.FutharkTrainingStepFailed;
@@ -1412,23 +1389,19 @@ pub const RSFAccelerator = struct {
     }
 
     fn normalizeMasterStackLocked(self: *Self, master: FutharkArray3DF32, target: f32, iterations: usize) AccelError!struct { array: FutharkArray3DF32, before: f32, after: f32 } {
-        var tuple: ?*futhark.struct_futhark_opaque_tup3_stack_spectral = null;
-        const rc = futhark.futhark_entry_stack_spectral_normalize(
+        var array: ?*futhark.struct_futhark_f32_3d = null;
+        var before: f32 = 0.0;
+        var after: f32 = 0.0;
+        const rc = futhark.abi.call_stack_spectral_normalize(
             self.ctx.ctx,
-            &tuple,
+            &array,
+            &before,
+            &after,
             master.arr,
             target,
             @intCast(iterations),
         );
-        if (rc != 0 or tuple == null) return AccelError.FutharkForwardFailed;
-        var array: ?*futhark.struct_futhark_f32_3d = null;
-        var before: f32 = 0.0;
-        var after: f32 = 0.0;
-        const p0 = futhark.futhark_project_opaque_tup3_arr3d_f32_f32_f32_0(self.ctx.ctx, &array, tuple);
-        const p1 = futhark.futhark_project_opaque_tup3_arr3d_f32_f32_f32_1(self.ctx.ctx, &before, tuple);
-        const p2 = futhark.futhark_project_opaque_tup3_arr3d_f32_f32_f32_2(self.ctx.ctx, &after, tuple);
-        _ = futhark.futhark_free_opaque_tup3_arr3d_f32_f32_f32(self.ctx.ctx, tuple);
-        if (p0 != 0 or p1 != 0 or p2 != 0 or array == null or !std.math.isFinite(before) or !std.math.isFinite(after)) {
+        if (rc != 0 or array == null or !std.math.isFinite(before) or !std.math.isFinite(after)) {
             if (array) |value| _ = futhark.futhark_free_f32_3d(self.ctx.ctx, value);
             return AccelError.FutharkForwardFailed;
         }
@@ -1982,10 +1955,14 @@ pub const EmbeddingAccelerator = struct {
         const ms = &(self.momentum_state orelse return AccelError.NullPointer);
         const fs = &(self.fisher_state orelse return AccelError.NullPointer);
 
-        var tuple: ?*futhark.struct_futhark_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32 = null;
-        const rc = futhark.futhark_entry_embedding_update_sfd_master(
+        var new_master: ?*futhark.struct_futhark_f32_2d = null;
+        var new_momentum: ?*futhark.struct_futhark_f32_2d = null;
+        var new_fisher: ?*futhark.struct_futhark_f32_2d = null;
+        const rc = futhark.abi.call_embedding_update_sfd_master(
             self.ctx.ctx,
-            &tuple,
+            &new_master,
+            &new_momentum,
+            &new_fisher,
             self.master_weight.arr,
             self.grad_weight.arr,
             ms.arr,
@@ -1998,15 +1975,7 @@ pub const EmbeddingAccelerator = struct {
             trust_ratio,
             weight_floor,
         );
-        if (rc != 0 or tuple == null) return AccelError.FutharkSFDUpdateFailed;
-        var new_master: ?*futhark.struct_futhark_f32_2d = null;
-        var new_momentum: ?*futhark.struct_futhark_f32_2d = null;
-        var new_fisher: ?*futhark.struct_futhark_f32_2d = null;
-        const p0 = futhark.futhark_project_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32_0(self.ctx.ctx, &new_master, tuple);
-        const p1 = futhark.futhark_project_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32_1(self.ctx.ctx, &new_momentum, tuple);
-        const p2 = futhark.futhark_project_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32_2(self.ctx.ctx, &new_fisher, tuple);
-        _ = futhark.futhark_free_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32(self.ctx.ctx, tuple);
-        if (p0 != 0 or p1 != 0 or p2 != 0 or new_master == null or new_momentum == null or new_fisher == null) {
+        if (rc != 0 or new_master == null or new_momentum == null or new_fisher == null) {
             if (new_master) |array| _ = futhark.futhark_free_f32_2d(self.ctx.ctx, array);
             if (new_momentum) |array| _ = futhark.futhark_free_f32_2d(self.ctx.ctx, array);
             if (new_fisher) |array| _ = futhark.futhark_free_f32_2d(self.ctx.ctx, array);
@@ -2118,29 +2087,25 @@ pub const EmbeddingAccelerator = struct {
         if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
         if (self.master_weight.arr == null or u.arr == null or v.arr == null) return AccelError.NullPointer;
         if (power_iters == 0 or !std.math.isFinite(target) or target <= 0.0) return AccelError.InvalidHyperparameter;
-        var tuple: ?*futhark.struct_futhark_opaque_tup5_embedding_spectral = null;
-        const rc = futhark.futhark_entry_embedding_spectral_normalize(
+        var new_master: ?*futhark.struct_futhark_f32_2d = null;
+        var new_u: ?*futhark.struct_futhark_f32_1d = null;
+        var new_v: ?*futhark.struct_futhark_f32_1d = null;
+        var sigma_before: f32 = 0.0;
+        var sigma_after: f32 = 0.0;
+        const rc = futhark.abi.call_embedding_spectral_normalize(
             self.ctx.ctx,
-            &tuple,
+            &new_master,
+            &new_u,
+            &new_v,
+            &sigma_before,
+            &sigma_after,
             self.master_weight.arr,
             u.arr,
             v.arr,
             try checkedDimensionI64(power_iters),
             target,
         );
-        if (rc != 0 or tuple == null) return AccelError.FutharkForwardFailed;
-        var new_master: ?*futhark.struct_futhark_f32_2d = null;
-        var new_u: ?*futhark.struct_futhark_f32_1d = null;
-        var new_v: ?*futhark.struct_futhark_f32_1d = null;
-        var sigma_before: f32 = 0.0;
-        var sigma_after: f32 = 0.0;
-        const p0 = futhark.futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_0(self.ctx.ctx, &new_master, tuple);
-        const p1 = futhark.futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_1(self.ctx.ctx, &new_u, tuple);
-        const p2 = futhark.futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_2(self.ctx.ctx, &new_v, tuple);
-        const p3 = futhark.futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_3(self.ctx.ctx, &sigma_before, tuple);
-        const p4 = futhark.futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_4(self.ctx.ctx, &sigma_after, tuple);
-        _ = futhark.futhark_free_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32(self.ctx.ctx, tuple);
-        if (p0 != 0 or p1 != 0 or p2 != 0 or p3 != 0 or p4 != 0 or new_master == null or new_u == null or new_v == null or !std.math.isFinite(sigma_before) or !std.math.isFinite(sigma_after)) {
+        if (rc != 0 or new_master == null or new_u == null or new_v == null or !std.math.isFinite(sigma_before) or !std.math.isFinite(sigma_after)) {
             if (new_master) |array| _ = futhark.futhark_free_f32_2d(self.ctx.ctx, array);
             if (new_u) |array| _ = futhark.futhark_free_f32_1d(self.ctx.ctx, array);
             if (new_v) |array| _ = futhark.futhark_free_f32_1d(self.ctx.ctx, array);
@@ -2238,13 +2203,6 @@ pub fn batchEncodeGraph(
         };
         defer in_chunk.free(ctx);
 
-        var out_tup: ?*futhark.struct_futhark_opaque_tup7_graph_encode = null;
-        defer {
-            if (out_tup) |p| {
-                _ = futhark.futhark_free_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64(ctx.ctx, p);
-            }
-        }
-
         var out_ids: ?*futhark.struct_futhark_u64_1d = null;
         var out_re_a: ?*futhark.struct_futhark_f32_1d = null;
         var out_im_a: ?*futhark.struct_futhark_f32_1d = null;
@@ -2263,9 +2221,15 @@ pub fn batchEncodeGraph(
             if (out_edge_tgts) |p| _ = futhark.futhark_free_i64_1d(ctx.ctx, p);
         }
 
-        const rc = futhark.futhark_entry_graph_batch_encode(
+        const rc = futhark.abi.call_graph_batch_encode(
             ctx.ctx,
-            &out_tup,
+            &out_ids,
+            &out_re_a,
+            &out_im_a,
+            &out_re_b,
+            &out_im_b,
+            &out_edge_srcs,
+            &out_edge_tgts,
             in_chunk.arr,
             seed,
         );
@@ -2291,22 +2255,6 @@ pub fn batchEncodeGraph(
                 std.debug.print("[batchEncodeGraph] futhark_context_sync failed at offset={d} n={d}: rc={d}\n", .{ offset, chunk_n, sync_rc });
             }
             return AccelError.FutharkSyncFailed;
-        }
-
-        const tup = out_tup orelse {
-            std.debug.print("[batchEncodeGraph] out_tup null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        };
-        const proj0 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_0(ctx.ctx, &out_ids, tup);
-        const proj1 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_1(ctx.ctx, &out_re_a, tup);
-        const proj2 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_2(ctx.ctx, &out_im_a, tup);
-        const proj3 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_3(ctx.ctx, &out_re_b, tup);
-        const proj4 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_4(ctx.ctx, &out_im_b, tup);
-        const proj5 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_5(ctx.ctx, &out_edge_srcs, tup);
-        const proj6 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_6(ctx.ctx, &out_edge_tgts, tup);
-        if (proj0 != 0 or proj1 != 0 or proj2 != 0 or proj3 != 0 or proj4 != 0 or proj5 != 0 or proj6 != 0) {
-            std.debug.print("[batchEncodeGraph] projection failed at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.FutharkForwardFailed;
         }
 
         if (out_ids == null) {
