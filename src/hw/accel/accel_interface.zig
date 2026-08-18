@@ -1408,7 +1408,7 @@ pub const RSFAccelerator = struct {
             defer self.allocator.free(flat);
             const start = try std.math.mul(usize, layer_idx, per_layer);
             @memcpy(flat[start .. start + per_layer], data);
-            var replacement = try FutharkArray3DF16.newFromFlat(&self.ctx, flat, self.num_layers, half, cols);
+            const replacement = try FutharkArray3DF16.newFromFlat(&self.ctx, flat, self.num_layers, half, cols);
             if (self.stack_weights_s) |*old| old.free(&self.ctx);
             self.stack_weights_s = replacement;
         } else {
@@ -1417,7 +1417,7 @@ pub const RSFAccelerator = struct {
             defer self.allocator.free(flat);
             const start = try std.math.mul(usize, layer_idx, per_layer);
             @memcpy(flat[start .. start + per_layer], data);
-            var replacement = try FutharkArray3DF16.newFromFlat(&self.ctx, flat, self.num_layers, half, cols);
+            const replacement = try FutharkArray3DF16.newFromFlat(&self.ctx, flat, self.num_layers, half, cols);
             if (self.stack_weights_t) |*old| old.free(&self.ctx);
             self.stack_weights_t = replacement;
         }
@@ -2062,7 +2062,7 @@ pub const EmbeddingAccelerator = struct {
         try self.ensureFisherState();
         const master = try self.master_weight.valuesFlat(self.ctx, allocator);
         errdefer allocator.free(master);
-        const momementum_state.?.valuesFlat(self.ctx, allocator);
+        const momentum = try self.momentum_state.?.valuesFlat(self.ctx, allocator);
         errdefer allocator.free(momentum);
         const fisher = try self.fisher_state.?.valuesFlat(self.ctx, allocator);
         return .{ .master_weights = master, .momentum = momentum, .fisher = fisher, .step = self.optimizer_step, .allocator = allocator };
@@ -2176,6 +2176,168 @@ pub const EmbeddingAccelerator = struct {
         v.* = .{ .arr = new_v, .len = self.dim };
         self.last_spectral_before = sigma_before;
         self.last_spectral_after = sigma_after;
+    }
+};
+
+
+pub const FrozenEmbedding = struct {
+    ctx: *FutharkContext,
+    weight: FutharkArray2DF16,
+    vocab_size: usize,
+    dim: usize,
+    initialized: bool,
+    allocator: std.mem.Allocator,
+    scratch_token_buf: []i64 = &[_]i64{},
+    scratch_token_cap: usize = 0,
+    scratch_lengths_buf: []i64 = &[_]i64{},
+    scratch_lengths_cap: usize = 0,
+    scratch_positions_buf: []i64 = &[_]i64{},
+    scratch_positions_cap: usize = 0,
+
+    const Self = @This();
+
+    fn allocScratch(allocator: std.mem.Allocator) AccelError!struct { tokens: []i64, lengths: []i64, positions: []i64, token_cap: usize } {
+        const max_batch: usize = 2048;
+        const max_seq: usize = 1024;
+        const scratch_count = std.math.mul(usize, max_batch, max_seq) catch return AccelError.InvalidDimensions;
+        const tokens = allocator.alloc(i64, scratch_count) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(tokens);
+        const lengths = allocator.alloc(i64, max_batch) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(lengths);
+        const positions = allocator.alloc(i64, max_seq) catch return AccelError.AllocationFailed;
+        return .{ .tokens = tokens, .lengths = lengths, .positions = positions, .token_cap = scratch_count };
+    }
+
+    pub fn initFromTrainableMaster(src: *EmbeddingAccelerator) AccelError!Self {
+        if (!src.initialized or src.ctx.ctx == null or src.master_weight.arr == null) return AccelError.NullPointer;
+        var shadow_ptr: ?*futhark.struct_futhark_f16_2d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_2d(src.ctx.ctx, &shadow_ptr, src.master_weight.arr) != 0 or shadow_ptr == null) {
+            return AccelError.FutharkArrayNewFailed;
+        }
+        var weight = FutharkArray2DF16{ .arr = shadow_ptr, .rows = src.vocab_size, .cols = src.dim };
+        errdefer weight.free(src.ctx);
+        const scratch = try allocScratch(src.allocator);
+        return .{
+            .ctx = src.ctx,
+            .weight = weight,
+            .vocab_size = src.vocab_size,
+            .dim = src.dim,
+            .initialized = true,
+            .allocator = src.allocator,
+            .scratch_token_buf = scratch.tokens,
+            .scratch_token_cap = scratch.token_cap,
+            .scratch_lengths_buf = scratch.lengths,
+            .scratch_lengths_cap = 2048,
+            .scratch_positions_buf = scratch.positions,
+            .scratch_positions_cap = 1024,
+        };
+    }
+
+    pub fn initFromMasterWeights(ctx: *FutharkContext, allocator: std.mem.Allocator, vocab_size: usize, dim: usize, master_values: []const f32) AccelError!Self {
+        if (ctx.ctx == null) return AccelError.NullPointer;
+        const total = std.math.mul(usize, vocab_size, dim) catch return AccelError.InvalidDimensions;
+        if (vocab_size == 0 or dim == 0 or master_values.len != total) return AccelError.InvalidDimensions;
+        for (master_values) |value| if (!std.math.isFinite(value)) return AccelError.InvalidHyperparameter;
+        var master = try FutharkArray2DF32.newFromFlat(ctx, master_values, vocab_size, dim);
+        defer master.free(ctx);
+        var shadow_ptr: ?*futhark.struct_futhark_f16_2d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_2d(ctx.ctx, &shadow_ptr, master.arr) != 0 or shadow_ptr == null) {
+            return AccelError.FutharkArrayNewFailed;
+        }
+        var weight = FutharkArray2DF16{ .arr = shadow_ptr, .rows = vocab_size, .cols = dim };
+        errdefer weight.free(ctx);
+        const scratch = try allocScratch(allocator);
+        return .{
+            .ctx = ctx,
+            .weight = weight,
+            .vocab_size = vocab_size,
+            .dim = dim,
+            .initialized = true,
+            .allocator = allocator,
+            .scratch_token_buf = scratch.tokens,
+            .scratch_token_cap = scratch.token_cap,
+            .scratch_lengths_buf = scratch.lengths,
+            .scratch_lengths_cap = 2048,
+            .scratch_positions_buf = scratch.positions,
+            .scratch_positions_cap = 1024,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (!self.initialized) return;
+        self.weight.free(self.ctx);
+        if (self.scratch_positions_buf.len > 0) self.allocator.free(self.scratch_positions_buf);
+        if (self.scratch_lengths_buf.len > 0) self.allocator.free(self.scratch_lengths_buf);
+        if (self.scratch_token_buf.len > 0) self.allocator.free(self.scratch_token_buf);
+        self.initialized = false;
+    }
+
+    pub fn exportAsF32(self: *Self, allocator: std.mem.Allocator) AccelError![]f32 {
+        if (!self.initialized or self.weight.arr == null) return AccelError.NullPointer;
+        const half = try self.weight.valuesFlat(self.ctx, allocator);
+        defer allocator.free(half);
+        const out = allocator.alloc(f32, half.len) catch return AccelError.AllocationFailed;
+        for (half, out) |value, *master| master.* = @floatCast(value);
+        return out;
+    }
+
+    pub fn forwardPadded(
+        self: *Self,
+        tokens: []const u32,
+        sequence_lengths: []const usize,
+        sequence_length: usize,
+    ) AccelError!FutharkArray3DF16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (sequence_lengths.len == 0 or sequence_length == 0) return AccelError.InvalidDimensions;
+        const expected_tokens = std.math.mul(usize, sequence_lengths.len, sequence_length) catch return AccelError.InvalidDimensions;
+        if (tokens.len != expected_tokens) return AccelError.InvalidDimensions;
+
+        const token_i64s = if (tokens.len <= self.scratch_token_cap) self.scratch_token_buf[0..tokens.len] else (self.allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed);
+        defer if (tokens.len > self.scratch_token_cap) self.allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        const lengths_i64 = if (sequence_lengths.len <= self.scratch_lengths_cap) self.scratch_lengths_buf[0..sequence_lengths.len] else (self.allocator.alloc(i64, sequence_lengths.len) catch return AccelError.AllocationFailed);
+        defer if (sequence_lengths.len > self.scratch_lengths_cap) self.allocator.free(lengths_i64);
+        for (sequence_lengths, 0..) |length, index| {
+            if (length > sequence_length) return AccelError.InvalidDimensions;
+            lengths_i64[index] = @intCast(length);
+        }
+
+        const positions_i64 = if (sequence_length <= self.scratch_positions_cap) self.scratch_positions_buf[0..sequence_length] else (self.allocator.alloc(i64, sequence_length) catch return AccelError.AllocationFailed);
+        defer if (sequence_length > self.scratch_positions_cap) self.allocator.free(positions_i64);
+        for (positions_i64, 0..) |*position, index| {
+            position.* = @intCast(index);
+        }
+
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths_i64);
+        defer length_array.free(self.ctx);
+        var position_array = try FutharkArray1DI64.newFromSlice(self.ctx, positions_i64);
+        defer position_array.free(self.ctx);
+
+        var output: ?*futhark.struct_futhark_f16_3d = null;
+        const result = futhark.futhark_entry_embedding_forward_padded(
+            self.ctx.ctx,
+            &output,
+            token_array.arr,
+            length_array.arr,
+            position_array.arr,
+            self.weight.arr,
+        );
+        if (result != 0 or output == null) {
+            if (output) |value| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, value);
+            return AccelError.FutharkForwardFailed;
+        }
+        return FutharkArray3DF16{
+            .arr = output,
+            .dim0 = sequence_lengths.len,
+            .dim1 = sequence_length,
+            .dim2 = self.dim,
+        };
     }
 };
 
@@ -2423,139 +2585,5 @@ pub fn batchEncodeGraph(
         .node_count = total_n,
         .edge_count = total_ne,
         .allocator = allocator,
-    };
-}
-locator,
-    };
-}
-) });
-            } else {
-                std.debug.print("[batchEncodeGraph] Futhark entry failed at offset={d} n={d}: rc={d}\n", .{ offset, chunk_n, rc });
-            }
-            return AccelError.FutharkForwardFailed;
-        }
-
-        const sync_rc = futhark.futhark_context_sync(ctx.ctx);
-        if (sync_rc != 0) {
-            const ctx_err = futhark.futhark_context_get_error(ctx.ctx);
-            defer freeFutharkError(ctx_err);
-            if (ctx_err) |msg| {
-                std.debug.print("[batchEncodeGraph] Futhark sync error at offset={d} n={d}: {s}\n", .{ offset, chunk_n, std.mem.span(msg) });
-            } else {
-                std.debug.print("[batchEncodeGraph] futhark_context_sync failed at offset={d} n={d}: rc={d}\n", .{ offset, chunk_n, sync_rc });
-            }
-            return AccelError.FutharkSyncFailed;
-        }
-
-        const tup = out_tup orelse {
-            std.debug.print("[batchEncodeGraph] out_tup null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        };
-        const proj0 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_0(ctx.ctx, &out_ids, tup);
-        const proj1 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_1(ctx.ctx, &out_re_a, tup);
-        const proj2 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_2(ctx.ctx, &out_im_a, tup);
-        const proj3 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_3(ctx.ctx, &out_re_b, tup);
-        const proj4 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_4(ctx.ctx, &out_im_b, tup);
-        const proj5 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_5(ctx.ctx, &out_edge_srcs, tup);
-        const proj6 = futhark.futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_i64_arr1d_i64_6(ctx.ctx, &out_edge_tgts, tup);
-        if (proj0 != 0 or proj1 != 0 or proj2 != 0 or proj3 != 0 or proj4 != 0 or proj5 != 0 or proj6 != 0) {
-            std.debug.print("[batchEncodeGraph] projection failed at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.FutharkForwardFailed;
-        }
-
-        if (out_ids == null) {
-            std.debug.print("[batchEncodeGraph] out_ids null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        }
-        if (out_re_a == null) {
-            std.debug.print("[batchEncodeGraph] out_re_a null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        }
-        if (out_im_a == null) {
-            std.debug.print("[batchEncodeGraph] out_im_a null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        }
-        if (out_re_b == null) {
-            std.debug.print("[batchEncodeGraph] out_re_b null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        }
-        if (out_im_b == null) {
-            std.debug.print("[batchEncodeGraph] out_im_b null at offset={d} n={d}\n", .{ offset, chunk_n });
-            return AccelError.NullPointer;
-        }
-        if (out_edge_srcs == null) {
-            std.debug.print("[batchEncodeGraph] out_edge_srcs null at offset={d} ne={d}\n", .{ offset, chunk_ne });
-            return AccelError.NullPointer;
-        }
-        if (out_edge_tgts == null) {
-            std.debug.print("[batchEncodeGraph] out_edge_tgts null at offset={d} ne={d}\n", .{ offset, chunk_ne });
-            return AccelError.NullPointer;
-        }
-
-        const ids_buf = allocator.alloc(u64, chunk_n) catch return AccelError.AllocationFailed;
-        defer allocator.free(ids_buf);
-        const re_a_buf = allocator.alloc(f32, chunk_n) catch return AccelError.AllocationFailed;
-        defer allocator.free(re_a_buf);
-        const im_a_buf = allocator.alloc(f32, chunk_n) catch return AccelError.AllocationFailed;
-        defer allocator.free(im_a_buf);
-        const re_b_buf = allocator.alloc(f32, chunk_n) catch return AccelError.AllocationFailed;
-        defer allocator.free(re_b_buf);
-        const im_b_buf = allocator.alloc(f32, chunk_n) catch return AccelError.AllocationFailed;
-        defer allocator.free(im_b_buf);
-        const edge_src_buf = allocator.alloc(i64, chunk_ne) catch return AccelError.AllocationFailed;
-        defer allocator.free(edge_src_buf);
-        const edge_tgt_buf = allocator.alloc(i64, chunk_ne) catch return AccelError.AllocationFailed;
-        defer allocator.free(edge_tgt_buf);
-
-        if (futhark.futhark_values_u64_1d(ctx.ctx, out_ids, ids_buf.ptr) != 0 or
-            futhark.futhark_values_f32_1d(ctx.ctx, out_re_a, re_a_buf.ptr) != 0 or
-            futhark.futhark_values_f32_1d(ctx.ctx, out_im_a, im_a_buf.ptr) != 0 or
-            futhark.futhark_values_f32_1d(ctx.ctx, out_re_b, re_b_buf.ptr) != 0 or
-            futhark.futhark_values_f32_1d(ctx.ctx, out_im_b, im_b_buf.ptr) != 0 or
-            futhark.futhark_values_i64_1d(ctx.ctx, out_edge_srcs, edge_src_buf.ptr) != 0 or
-            futhark.futhark_values_i64_1d(ctx.ctx, out_edge_tgts, edge_tgt_buf.ptr) != 0) return AccelError.FutharkValuesFailed;
-        if (futhark.futhark_context_sync(ctx.ctx) != 0) return AccelError.FutharkSyncFailed;
-        acc_hashes.appendSlice(ids_buf) catch return AccelError.AllocationFailed;
-        acc_re_a.appendSlice(re_a_buf) catch return AccelError.AllocationFailed;
-        acc_im_a.appendSlice(im_a_buf) catch return AccelError.AllocationFailed;
-        acc_re_b.appendSlice(re_b_buf) catch return AccelError.AllocationFailed;
-        acc_im_b.appendSlice(im_b_buf) catch return AccelError.AllocationFailed;
-        for (edge_src_buf) |value| acc_edge_srcs.append(if (value >= 0) value + @as(i64, @intCast(offset)) else value) catch return AccelError.AllocationFailed;
-        for (edge_tgt_buf) |value| acc_edge_tgts.append(if (value >= 0) value + @as(i64, @intCast(offset)) else value) catch return AccelError.AllocationFailed;
-
-        offset = chunk_end;
-    }
-
-    const total_n = acc_hashes.items.len;
-    const total_ne = acc_edge_srcs.items.len;
-
-    const owned_hashes = acc_hashes.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_hashes);
-    const owned_re_a = acc_re_a.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_re_a);
-    const owned_im_a = acc_im_a.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_im_a);
-    const owned_re_b = acc_re_b.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_re_b);
-    const owned_im_b = acc_im_b.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_im_b);
-    const owned_edge_srcs = acc_edge_srcs.toOwnedSlice() catch return AccelError.AllocationFailed;
-    errdefer allocator.free(owned_edge_srcs);
-    const owned_edge_tgts = acc_edge_tgts.toOwnedSlice() catch return AccelError.AllocationFailed;
-
-    return GraphBatchEncodeResult{
-        .hashes = owned_hashes,
-        .re_a = owned_re_a,
-        .im_a = owned_im_a,
-        .re_b = owned_re_b,
-        .im_b = owned_im_b,
-        .edge_srcs = owned_edge_srcs,
-        .edge_tgts = owned_edge_tgts,
-        .node_count = total_n,
-        .edge_count = total_ne,
-        .allocator = allocator,
-    };
-}
-locator,
     };
 }

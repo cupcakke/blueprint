@@ -87,7 +87,7 @@ test "pack tokens drops pad columns" {
 }
 
 test "scatter rows restores padded layout" {
-    const src = [_]f16{ 1, 2, 3, 4, 5, 6 };
+    const src = [_]f16{ 1, 2, 0, 0, 3, 4, 5, 6 };
     var dest: [12]f16 = undefined;
     const lengths = [_]usize{ 1, 2 };
     try scatterRows(&dest, &src, 2, 3, 2, 2, &lengths);
