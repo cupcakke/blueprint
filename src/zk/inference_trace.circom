@@ -323,8 +323,8 @@ template RSFLayerComputation(dim) {
     assert(dim % 2 == 0);
 
     signal input x[dim];
-    signal input weights_s[dim / 2][dim / 2 + 1];
-    signal input weights_t[dim / 2][dim / 2 + 1];
+    signal input weights_s[dim / 2][2];
+    signal input weights_t[dim / 2][2];
     signal input expected_commitment;
     signal output y[dim];
     signal output valid_commitment;
@@ -339,17 +339,10 @@ template RSFLayerComputation(dim) {
         x2[i] <== x[half + i];
     }
 
-    signal s_partial[half][half + 1];
     signal s_x2[half];
 
     for (var i = 0; i < half; i++) {
-        s_partial[i][0] <== 0;
-
-        for (var j = 0; j < half; j++) {
-            s_partial[i][j + 1] <== s_partial[i][j] + weights_s[i][j] * x2[j];
-        }
-
-        s_x2[i] <== s_partial[i][half] + weights_s[i][half];
+        s_x2[i] <== weights_s[i][0] * x2[i] + weights_s[i][1];
     }
 
     signal y1[half];
@@ -394,17 +387,10 @@ template RSFLayerComputation(dim) {
         y1[i] <== final_division[i].quotient;
     }
 
-    signal t_partial[half][half + 1];
     signal t_y1[half];
 
     for (var i = 0; i < half; i++) {
-        t_partial[i][0] <== 0;
-
-        for (var j = 0; j < half; j++) {
-            t_partial[i][j + 1] <== t_partial[i][j] + weights_t[i][j] * y1[j];
-        }
-
-        t_y1[i] <== t_partial[i][half] + weights_t[i][half];
+        t_y1[i] <== weights_t[i][0] * y1[i] + weights_t[i][1];
     }
 
     signal y2[half];
@@ -938,8 +924,8 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     assert(precision_bits < 120);
 
     signal input tokens[dim];
-    signal input layer_weights_s[num_layers][dim / 2][dim / 2 + 1];
-    signal input layer_weights_t[num_layers][dim / 2][dim / 2 + 1];
+    signal input layer_weights_s[num_layers][dim / 2][2];
+    signal input layer_weights_t[num_layers][dim / 2][2];
     signal input expected_output[dim];
     signal input input_commitment;
     signal input output_commitment;
@@ -971,7 +957,7 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
         rsf_layers[layer] = RSFLayerComputation(dim);
 
         for (var i = 0; i < dim / 2; i++) {
-            for (var j = 0; j < dim / 2 + 1; j++) {
+            for (var j = 0; j < 2; j++) {
                 rsf_layers[layer].weights_s[i][j] <== layer_weights_s[layer][i][j];
                 rsf_layers[layer].weights_t[i][j] <== layer_weights_t[layer][i][j];
             }
@@ -1060,8 +1046,8 @@ template InferenceTraceWithBatch(num_layers, dim, batch_size, precision_bits) {
     assert(precision_bits < 120);
 
     signal input tokens[batch_size][dim];
-    signal input layer_weights_s[num_layers][dim / 2][dim / 2 + 1];
-    signal input layer_weights_t[num_layers][dim / 2][dim / 2 + 1];
+    signal input layer_weights_s[num_layers][dim / 2][2];
+    signal input layer_weights_t[num_layers][dim / 2][2];
     signal input expected_outputs[batch_size][dim];
     signal input input_commitments[batch_size];
     signal input output_commitments[batch_size];
@@ -1083,7 +1069,7 @@ template InferenceTraceWithBatch(num_layers, dim, batch_size, precision_bits) {
 
         for (var layer = 0; layer < num_layers; layer++) {
             for (var i = 0; i < dim / 2; i++) {
-                for (var j = 0; j < dim / 2 + 1; j++) {
+                for (var j = 0; j < 2; j++) {
                     inference_proofs[b].layer_weights_s[layer][i][j] <== layer_weights_s[layer][i][j];
                     inference_proofs[b].layer_weights_t[layer][i][j] <== layer_weights_t[layer][i][j];
                 }

@@ -140,6 +140,7 @@ pub fn build(b: *std.Build) void {
     const test_specs = [_]TestSpec{
         .{ .step = "test-tensor", .wrapper = "src/test_root_tensor.zig", .desc = "Run tensor tests" },
         .{ .step = "test-memory", .wrapper = "src/test_root_memory.zig", .desc = "Run memory tests" },
+        .{ .step = "test-gpu-memory", .wrapper = "src/test_root_gpu_memory.zig", .desc = "Run GPU memory estimator and compact-batch tests" },
         .{ .step = "test-sfd", .wrapper = "src/test_root_sfd.zig", .desc = "Run SFD optimizer tests" },
         .{ .step = "test-embedding", .wrapper = "src/test_root_embedding.zig", .desc = "Run embedding tests" },
         .{ .step = "test-rsf", .wrapper = "src/test_root_rsf.zig", .desc = "Run RSF tests" },

@@ -243,7 +243,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     const layer_count: usize = @intCast(layer_count_u64);
     const vocab_size: usize = @intCast(vocab_size_u64);
     const rsf_dim = model_dim / 2;
-    const columns = std.math.add(usize, rsf_dim, 1) catch return error.InvalidCheckpointModel;
+    const columns: usize = 2;
     const matrix_length = std.math.mul(usize, rsf_dim, columns) catch return error.InvalidCheckpointModel;
     const stack_length = std.math.mul(usize, matrix_length, layer_count) catch return error.InvalidCheckpointModel;
     const stack_state_bytes = std.math.mul(usize, stack_length, @sizeOf(f32) * 6) catch return error.InvalidCheckpointModel;
