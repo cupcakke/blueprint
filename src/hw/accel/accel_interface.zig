@@ -28,7 +28,28 @@ pub const AccelError = error{
     InvalidToken,
     AllocationFailed,
     PartialRowCleanup,
+    StackOnlyModeForbidden,
+    MirrorStateUnavailable,
 };
+
+pub const RSFOwnershipMode = enum { stack_only, mirrored };
+
+pub fn logDeviceAllocation(label: []const u8, dim0: usize, dim1: usize, dim2: usize, element_bytes: usize, element_count: usize, elapsed_ms: i64) void {
+    if (comptime !gpu_enabled) return;
+    const byte_count = std.math.mul(usize, element_count, element_bytes) catch 0;
+    const memory = cuda.queryMemoryInfo() catch null;
+    if (memory) |info| {
+        std.debug.print(
+            "[gpu-allocation] {s} dims={d}x{d}x{d} bytes_per_element={d} elements={d} requested={d} elapsed_ms={d} gpu_free_after={d}\n",
+            .{ label, dim0, dim1, dim2, element_bytes, element_count, byte_count, elapsed_ms, info.free_bytes },
+        );
+    } else {
+        std.debug.print(
+            "[gpu-allocation] {s} dims={d}x{d}x{d} bytes_per_element={d} elements={d} requested={d} elapsed_ms={d} gpu_free_after=unavailable\n",
+            .{ label, dim0, dim1, dim2, element_bytes, element_count, byte_count, elapsed_ms },
+        );
+    }
+}
 
 pub const RSFOptimizerState = struct {
     master_weights_s: []f32,
@@ -94,6 +115,9 @@ pub const FutharkContext = struct {
     ctx: ?*futhark.struct_futhark_context,
     cfg: ?*futhark.struct_futhark_context_config,
     mutex: std.Thread.Mutex = .{},
+    settings: futhark.ContextSettings = .{},
+    device_identity: ?cuda.DeviceIdentity = null,
+    device_memory: ?cuda.DeviceMemoryInfo = null,
 
     const Self = @This();
 
@@ -101,15 +125,51 @@ pub const FutharkContext = struct {
         const cfg = futhark.futhark_context_config_new();
         if (cfg == null) return AccelError.FutharkConfigFailed;
 
+        var settings = futhark.ContextSettings{};
         if (comptime gpu_enabled) {
             const cache_file: ?[*:0]const u8 = if (std.posix.getenv("JAIDE_FUTHARK_CACHE")) |cache_path| blk: {
                 std.debug.print("[FutharkContext] GPU kernel cache: {s}\n", .{cache_path});
                 break :blk @as([*:0]const u8, @ptrCast(cache_path.ptr));
             } else blk: {
-                std.debug.print("[FutharkContext] WARN: JAIDE_FUTHARK_CACHE not set — NVRTC will recompile on every container start\n", .{});
+                std.debug.print("[FutharkContext] WARN: JAIDE_FUTHARK_CACHE not set - NVRTC will recompile on every container start\n", .{});
                 break :blk null;
             };
-            futhark.configureGpuContext(cfg, cache_file) catch return AccelError.FutharkConfigFailed;
+            settings = futhark.configureGpuContext(cfg, cache_file) catch return AccelError.FutharkConfigFailed;
+        }
+
+        var device_identity: ?cuda.DeviceIdentity = null;
+        var device_memory: ?cuda.DeviceMemoryInfo = null;
+        if (comptime gpu_enabled) {
+            var device_index: c_int = 0;
+            if (cuda.cudaGetDevice(&device_index) == cuda.cudaSuccess) {
+                device_identity = cuda.queryDeviceIdentity(device_index) catch null;
+                device_memory = cuda.queryMemoryInfo() catch null;
+            }
+            const identity_or_zero = device_identity orelse cuda.DeviceIdentity{};
+            std.debug.print(
+                "[FutharkContext] device={d} compute_capability={d}.{d} unified_memory={s} logging={s} debugging={s} profiling={s} group_size={d} num_groups={d} tile_size={d}\n",
+                .{
+                    device_index,
+                    identity_or_zero.compute_capability_major,
+                    identity_or_zero.compute_capability_minor,
+                    if (settings.unified_memory_enabled) "enabled" else "disabled",
+                    if (settings.logging_enabled) "enabled" else "disabled",
+                    if (settings.debugging_enabled) "enabled" else "disabled",
+                    if (settings.profiling_enabled) "enabled" else "disabled",
+                    settings.default_group_size,
+                    settings.default_num_groups,
+                    settings.default_tile_size,
+                },
+            );
+            if (device_memory) |memory| {
+                std.debug.print(
+                    "[FutharkContext] device_memory total={d} bytes ({d:.3} GiB) free={d} bytes ({d:.3} GiB)\n",
+                    .{ memory.total_bytes, @as(f64, @floatFromInt(memory.total_bytes)) / 1073741824.0, memory.free_bytes, @as(f64, @floatFromInt(memory.free_bytes)) / 1073741824.0 },
+                );
+            }
+            if (settings.unified_memory_enabled) {
+                std.debug.print("[FutharkContext] WARN: unified/managed memory explicitly enabled via JAIDE_FUTHARK_UNIFIED_MEMORY=1; production training requires explicit device memory\n", .{});
+            }
         }
 
         const ctx = futhark.futhark_context_new(cfg);
@@ -124,7 +184,7 @@ pub const FutharkContext = struct {
             return AccelError.FutharkSyncFailed;
         }
 
-        return Self{ .ctx = ctx, .cfg = cfg, .mutex = .{} };
+        return Self{ .ctx = ctx, .cfg = cfg, .mutex = .{}, .settings = settings, .device_identity = device_identity, .device_memory = device_memory };
     }
 
     pub fn deinit(self: *Self) void {
@@ -669,6 +729,8 @@ pub const RSFAccelerator = struct {
     stack_fisher_t: ?FutharkArray3DF32 = null,
     stack_arrays_valid: bool = false,
     layers_mirror_valid: bool = true,
+    ownership_mode: RSFOwnershipMode = .mirrored,
+    mirror_device_allocations: usize = 0,
     optimizer_step: u64 = 0,
     last_spectral_before: f32 = 0.0,
     last_spectral_after: f32 = 0.0,
@@ -677,6 +739,112 @@ pub const RSFAccelerator = struct {
 
     pub fn init(model_dim: usize) AccelError!Self {
         return initMultiLayer(model_dim, 1, std.heap.page_allocator);
+    }
+
+    pub fn initStackOnly(model_dim: usize, num_layers: usize, allocator: std.mem.Allocator, depth_compensation: bool) AccelError!Self {
+        const started_ns = std.time.nanoTimestamp();
+        if (model_dim == 0 or model_dim % 2 != 0) return AccelError.InvalidDimensions;
+        if (num_layers == 0) return AccelError.InvalidDimensions;
+        const half: usize = model_dim / 2;
+        const columns = std.math.add(usize, half, 1) catch return AccelError.InvalidDimensions;
+        const per_layer = std.math.mul(usize, half, columns) catch return AccelError.InvalidDimensions;
+        const stack_count = std.math.mul(usize, num_layers, per_layer) catch return AccelError.InvalidDimensions;
+
+        var ctx = try FutharkContext.init();
+        errdefer ctx.deinit();
+
+        const base_seed: u64 = 0x4A41494445204E4F;
+        const depth_scale: f32 = if (depth_compensation)
+            1.0 / @sqrt(@as(f32, @floatFromInt(num_layers)))
+        else
+            1.0;
+        const init_stddev: f32 = depth_scale * 0.25 / @sqrt(@as(f32, @floatFromInt(half)));
+
+        const master_s_data = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
+        defer allocator.free(master_s_data);
+        const master_t_data = allocator.alloc(f32, stack_count) catch return AccelError.AllocationFailed;
+        defer allocator.free(master_t_data);
+
+        var layer_index: usize = 0;
+        while (layer_index < num_layers) : (layer_index += 1) {
+            const layer_seed = base_seed +% (@as(u64, @intCast(layer_index)) *% 0x9E3779B97F4A7C15);
+            var rng = std.Random.DefaultPrng.init(layer_seed);
+            const random = rng.random();
+            const base = layer_index * per_layer;
+            var index: usize = 0;
+            while (index < per_layer) : (index += 1) {
+                master_s_data[base + index] = random.floatNorm(f32) * init_stddev;
+                master_t_data[base + index] = random.floatNorm(f32) * init_stddev;
+            }
+            var row: usize = 0;
+            while (row < half) : (row += 1) {
+                master_s_data[base + row * columns + half] = 0.0;
+                master_t_data[base + row * columns + half] = 0.0;
+            }
+        }
+
+        const layers = allocator.alloc(RSFLayer, 0) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(layers);
+
+        var stack_master_s = try FutharkArray3DF32.newFromFlat(&ctx, master_s_data, num_layers, half, columns);
+        errdefer stack_master_s.free(&ctx);
+        logDeviceAllocation("rsf_stack_master_s", num_layers, half, columns, @sizeOf(f32), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+        var stack_master_t = try FutharkArray3DF32.newFromFlat(&ctx, master_t_data, num_layers, half, columns);
+        errdefer stack_master_t.free(&ctx);
+
+        var forward_pointer_s: ?*futhark.struct_futhark_f16_3d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_3d(ctx.ctx, &forward_pointer_s, stack_master_s.arr) != 0 or forward_pointer_s == null) return AccelError.FutharkScaleWeightsFailed;
+        var stack_shadow_s = FutharkArray3DF16{ .arr = forward_pointer_s, .dim0 = num_layers, .dim1 = half, .dim2 = columns };
+        errdefer stack_shadow_s.free(&ctx);
+        var forward_pointer_t: ?*futhark.struct_futhark_f16_3d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_3d(ctx.ctx, &forward_pointer_t, stack_master_t.arr) != 0 or forward_pointer_t == null) return AccelError.FutharkScaleWeightsFailed;
+        var stack_shadow_t = FutharkArray3DF16{ .arr = forward_pointer_t, .dim0 = num_layers, .dim1 = half, .dim2 = columns };
+        errdefer stack_shadow_t.free(&ctx);
+        logDeviceAllocation("rsf_stack_forward_shadows", num_layers, half, columns, @sizeOf(f16), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+
+        var momentum_s = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        errdefer momentum_s.free(&ctx);
+        var momentum_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        errdefer momentum_t.free(&ctx);
+        var fisher_s = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        errdefer fisher_s.free(&ctx);
+        var fisher_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        errdefer fisher_t.free(&ctx);
+        logDeviceAllocation("rsf_stack_optimizer_states", num_layers, half, columns, @sizeOf(f32), stack_count, @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms));
+
+        const max_batch: usize = 2048;
+        const scratch_lengths_buf = allocator.alloc(i64, max_batch) catch return AccelError.AllocationFailed;
+        errdefer allocator.free(scratch_lengths_buf);
+
+        std.debug.print(
+            "[RSFAccelerator] stack-only mode initialized dim={d} layers={d} stack_elements={d} per_layer_mirror_device_allocations=0\n",
+            .{ model_dim, num_layers, stack_count },
+        );
+        return .{
+            .ctx = ctx,
+            .layers = layers,
+            .layers_owner = allocator,
+            .allocator = allocator,
+            .model_dim = model_dim,
+            .num_layers = num_layers,
+            .clip_min = -5.0,
+            .clip_max = 5.0,
+            .initialized = true,
+            .scratch_lengths_buf = scratch_lengths_buf,
+            .scratch_lengths_cap = max_batch,
+            .stack_weights_s = stack_shadow_s,
+            .stack_weights_t = stack_shadow_t,
+            .stack_master_weights_s = stack_master_s,
+            .stack_master_weights_t = stack_master_t,
+            .stack_momentum_s = momentum_s,
+            .stack_momentum_t = momentum_t,
+            .stack_fisher_s = fisher_s,
+            .stack_fisher_t = fisher_t,
+            .stack_arrays_valid = true,
+            .layers_mirror_valid = false,
+            .ownership_mode = .stack_only,
+            .mirror_device_allocations = 0,
+        };
     }
 
     pub fn initMultiLayer(model_dim: usize, num_layers: usize, allocator: std.mem.Allocator) AccelError!Self {
@@ -801,6 +969,8 @@ pub const RSFAccelerator = struct {
             .stack_fisher_t = fisher_t,
             .stack_arrays_valid = true,
             .layers_mirror_valid = true,
+            .ownership_mode = .mirrored,
+            .mirror_device_allocations = 2 * num_layers,
         };
     }
 
@@ -852,6 +1022,7 @@ pub const RSFAccelerator = struct {
 
     pub fn layerPtr(self: *Self, layer_idx: usize) AccelError!*RSFLayer {
         if (!self.initialized) return AccelError.NullPointer;
+        if (self.ownership_mode == .stack_only) return AccelError.MirrorStateUnavailable;
         if (layer_idx >= self.layers.len) return AccelError.InvalidDimensions;
         return &self.layers[layer_idx];
     }
@@ -865,6 +1036,11 @@ pub const RSFAccelerator = struct {
             self.stack_master_weights_s != null and self.stack_master_weights_t != null and
             self.stack_momentum_s != null and self.stack_momentum_t != null and
             self.stack_fisher_s != null and self.stack_fisher_t != null) return;
+
+        if (self.ownership_mode == .stack_only) {
+            std.debug.print("[RSFAccelerator] stack-only invariant violated: stacks present={any} valid={any}; repacking from mirrors is impossible without mirror state\n", .{ self.stack_weights_s != null, self.stack_arrays_valid });
+            return AccelError.StackOnlyModeForbidden;
+        }
 
         const l_count = self.layers.len;
         const half = self.model_dim / 2;
@@ -936,6 +1112,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn syncLayersFromStack(self: *Self) AccelError!void {
+        if (self.ownership_mode == .stack_only) return AccelError.StackOnlyModeForbidden;
         if (!self.stack_arrays_valid) return;
         if (self.layers_mirror_valid) return;
         const half = self.model_dim / 2;
@@ -1042,6 +1219,7 @@ pub const RSFAccelerator = struct {
         if (!self.initialized) return AccelError.NullPointer;
         if (self.ctx.ctx == null) return AccelError.NullPointer;
         if (input.arr == null) return AccelError.NullPointer;
+        if (self.ownership_mode == .stack_only) return AccelError.StackOnlyModeForbidden;
         if (self.layers.len == 0) return AccelError.NullPointer;
         self.ctx.mutex.lock();
         defer self.ctx.mutex.unlock();
@@ -1388,6 +1566,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn setLayerWeightsS(self: *Self, layer_idx: usize, data: []const f16, rows: usize, cols: usize) AccelError!void {
+        if (self.ownership_mode == .stack_only) return AccelError.StackOnlyModeForbidden;
         const total = std.math.mul(usize, rows, cols) catch return AccelError.InvalidDimensions;
         if (rows == 0 or cols == 0 or data.len != total) return AccelError.InvalidDimensions;
         try self.syncLayersFromStack();
@@ -1400,6 +1579,7 @@ pub const RSFAccelerator = struct {
     }
 
     pub fn setLayerWeightsT(self: *Self, layer_idx: usize, data: []const f16, rows: usize, cols: usize) AccelError!void {
+        if (self.ownership_mode == .stack_only) return AccelError.StackOnlyModeForbidden;
         const total = std.math.mul(usize, rows, cols) catch return AccelError.InvalidDimensions;
         if (rows == 0 or cols == 0 or data.len != total) return AccelError.InvalidDimensions;
         try self.syncLayersFromStack();
@@ -2167,8 +2347,129 @@ pub const EmbeddingAccelerator = struct {
     }
 };
 
-pub const GraphBatchEncodeResult = struct {
-    hashes: []u64,
+pub const FrozenEmbeddingAccelerator = struct {
+    ctx: *FutharkContext,
+    weight: FutharkArray2DF16,
+    vocab_size: usize,
+    dim: usize,
+    initialized: bool,
+
+    const Self = @This();
+
+    pub fn initFromWeightF16(ctx: *FutharkContext, vocab_size: usize, dim: usize, weight_f16: []const f16) AccelError!Self {
+        if (ctx.ctx == null) return AccelError.NullPointer;
+        if (vocab_size == 0 or dim == 0) return AccelError.InvalidDimensions;
+        const total = std.math.mul(usize, vocab_size, dim) catch return AccelError.InvalidDimensions;
+        if (weight_f16.len != total) return AccelError.InvalidDimensions;
+        var weight = try FutharkArray2DF16.newFromFlat(ctx, weight_f16, vocab_size, dim);
+        errdefer weight.free(ctx);
+        std.debug.print("[FrozenEmbeddingAccelerator] allocated fp16 weight only vocab={d} dim={d} bytes={d} optimizer_state_bytes=0\n", .{ vocab_size, dim, total * @sizeOf(f16) });
+        return Self{ .ctx = ctx, .weight = weight, .vocab_size = vocab_size, .dim = dim, .initialized = true };
+    }
+
+    pub fn initFromMasterWeightsF32(ctx: *FutharkContext, vocab_size: usize, dim: usize, master_values: []const f32) AccelError!Self {
+        if (ctx.ctx == null) return AccelError.NullPointer;
+        const total = std.math.mul(usize, vocab_size, dim) catch return AccelError.InvalidDimensions;
+        if (vocab_size == 0 or dim == 0 or master_values.len != total) return AccelError.InvalidDimensions;
+        for (master_values) |value| if (!std.math.isFinite(value)) return AccelError.InvalidHyperparameter;
+        var master = try FutharkArray2DF32.newFromFlat(ctx, master_values, vocab_size, dim);
+        defer master.free(ctx);
+        var shadow_pointer: ?*futhark.struct_futhark_f16_2d = null;
+        if (futhark.futhark_entry_master_weights_to_f16_2d(ctx.ctx, &shadow_pointer, master.arr) != 0 or shadow_pointer == null) return AccelError.FutharkArrayNewFailed;
+        var weight = FutharkArray2DF16{ .arr = shadow_pointer, .rows = vocab_size, .cols = dim };
+        errdefer weight.free(ctx);
+        std.debug.print("[FrozenEmbeddingAccelerator] restored fp16 weight from fp32 masters vocab={d} dim={d} persistent_bytes={d}\n", .{ vocab_size, dim, total * @sizeOf(f16) });
+        return Self{ .ctx = ctx, .weight = weight, .vocab_size = vocab_size, .dim = dim, .initialized = true };
+    }
+
+    pub fn forwardPadded(
+        self: *Self,
+        tokens: []const u32,
+        sequence_lengths: []const usize,
+        sequence_length: usize,
+        allocator: std.mem.Allocator,
+    ) AccelError!FutharkArray3DF16 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        if (sequence_lengths.len == 0 or sequence_length == 0) return AccelError.InvalidDimensions;
+        const expected_tokens = std.math.mul(usize, sequence_lengths.len, sequence_length) catch return AccelError.InvalidDimensions;
+        if (tokens.len != expected_tokens) return AccelError.InvalidDimensions;
+
+        const token_i64s = allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(token_i64s);
+        for (tokens, 0..) |token, index| {
+            if (@as(usize, token) >= self.vocab_size) return AccelError.InvalidDimensions;
+            token_i64s[index] = @intCast(token);
+        }
+
+        const lengths_i64 = allocator.alloc(i64, sequence_lengths.len) catch return AccelError.AllocationFailed;
+        defer allocator.free(lengths_i64);
+        for (sequence_lengths, 0..) |length, index| {
+            if (length > sequence_length) return AccelError.InvalidDimensions;
+            lengths_i64[index] = @intCast(length);
+        }
+
+        const positions_i64 = allocator.alloc(i64, sequence_length) catch return AccelError.AllocationFailed;
+        defer allocator.free(positions_i64);
+        for (positions_i64, 0..) |*position, index| {
+            position.* = @intCast(index);
+        }
+
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        var token_array = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer token_array.free(self.ctx);
+        var length_array = try FutharkArray1DI64.newFromSlice(self.ctx, lengths_i64);
+        defer length_array.free(self.ctx);
+        var position_array = try FutharkArray1DI64.newFromSlice(self.ctx, positions_i64);
+        defer position_array.free(self.ctx);
+
+        var output: ?*futhark.struct_futhark_f16_3d = null;
+        const result = futhark.futhark_entry_embedding_forward_padded(
+            self.ctx.ctx,
+            &output,
+            token_array.arr,
+            length_array.arr,
+            position_array.arr,
+            self.weight.arr,
+        );
+        if (result != 0 or output == null) {
+            if (output) |value| _ = futhark.futhark_free_f16_3d(self.ctx.ctx, value);
+            return AccelError.FutharkForwardFailed;
+        }
+        return FutharkArray3DF16{
+            .arr = output,
+            .dim0 = sequence_lengths.len,
+            .dim1 = sequence_length,
+            .dim2 = self.dim,
+        };
+    }
+
+    pub fn exportMasterWeightsTemporary(self: *Self, allocator: std.mem.Allocator) AccelError![]f32 {
+        if (!self.initialized or self.ctx.ctx == null) return AccelError.NullPointer;
+        const flat_f16 = try self.weight.valuesFlat(self.ctx, allocator);
+        defer allocator.free(flat_f16);
+        const master_values = allocator.alloc(f32, flat_f16.len) catch return AccelError.AllocationFailed;
+        for (flat_f16, master_values) |value, *master| master.* = @floatCast(value);
+        return master_values;
+    }
+
+    pub fn weightChecksum(self: *Self, allocator: std.mem.Allocator) AccelError!u64 {
+        if (!self.initialized) return AccelError.NullPointer;
+        const flat = try self.weight.valuesFlat(self.ctx, allocator);
+        defer allocator.free(flat);
+        var hash = std.hash.Wyhash.init(0x46524F5A454E);
+        for (flat) |value| hash.update(std.mem.asBytes(&value));
+        return hash.final();
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (!self.initialized) return;
+        self.weight.free(self.ctx);
+        self.initialized = false;
+    }
+};
+
+pub const GraphBatchEncodeResult = struct {    hashes: []u64,
     re_a: []f32,
     im_a: []f32,
     re_b: []f32,
@@ -2190,16 +2491,40 @@ pub const GraphBatchEncodeResult = struct {
     }
 };
 
+pub const default_graph_chunk_size: usize = 65536;
+
+pub fn validateGraphChunkSize(chunk_size: usize) AccelError!usize {
+    if (chunk_size == 0) return AccelError.InvalidDimensions;
+    if (chunk_size > 16 * 1024 * 1024) return AccelError.InvalidDimensions;
+    return chunk_size;
+}
+
+pub fn graphChunkSizeFromEnvironment() AccelError!usize {
+    const raw = std.posix.getenv("JAIDE_GRAPH_CHUNK_SIZE") orelse return default_graph_chunk_size;
+    const value = std.fmt.parseInt(usize, raw, 10) catch return AccelError.InvalidDimensions;
+    return validateGraphChunkSize(value);
+}
+
+pub fn knowledgeGraphSkippedByEnvironment() bool {
+    const raw = std.posix.getenv("JAIDE_SKIP_KNOWLEDGE_GRAPH") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "yes") or std.mem.eql(u8, raw, "on");
+}
+
 pub fn batchEncodeGraph(
     ctx: *FutharkContext,
     hashes: []const u64,
     seed: u64,
     allocator: std.mem.Allocator,
+    chunk_size: usize,
 ) AccelError!GraphBatchEncodeResult {
     if (ctx.ctx == null) return AccelError.NullPointer;
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
     if (hashes.len == 0) return AccelError.InvalidDimensions;
+    const bounded_chunk_size = try validateGraphChunkSize(chunk_size);
+    if (hashes.len > bounded_chunk_size) {
+        std.debug.print("[batchEncodeGraph] streaming {d} hashes in {d} chunks of at most {d}\n", .{ hashes.len, (hashes.len + bounded_chunk_size - 1) / bounded_chunk_size, bounded_chunk_size });
+    }
 
     var acc_hashes = std.ArrayList(u64).init(allocator);
     errdefer acc_hashes.deinit();
@@ -2227,7 +2552,7 @@ pub fn batchEncodeGraph(
 
     var offset: usize = 0;
     while (offset < hashes.len) {
-        const chunk_end = hashes.len;
+        const chunk_end = @min(offset + bounded_chunk_size, hashes.len);
         const chunk = hashes[offset..chunk_end];
         const chunk_n = chunk.len;
         const chunk_ne = std.math.mul(usize, chunk_n, 3) catch return AccelError.InvalidDimensions;
@@ -2370,6 +2695,9 @@ pub fn batchEncodeGraph(
         for (edge_tgt_buf) |value| acc_edge_tgts.append(if (value >= 0) value + @as(i64, @intCast(offset)) else value) catch return AccelError.AllocationFailed;
 
         offset = chunk_end;
+        if (hashes.len > bounded_chunk_size) {
+            std.debug.print("[batchEncodeGraph] chunk committed offset={d}/{d} nodes={d} edges={d}\n", .{ offset, hashes.len, acc_hashes.items.len, acc_edge_srcs.items.len });
+        }
     }
 
     const total_n = acc_hashes.items.len;
