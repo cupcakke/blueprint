@@ -2688,6 +2688,7 @@ pub const DistributedTrainerFuthark = struct {
         self.config.spectral_interval = saved_spectral_interval;
         self.config.spectral_target_norm = saved_spectral_target;
         self.config.spectral_iterations = saved_spectral_iterations;
+        self.config.spectral_periodic_iterations = saved_spectral_iterations;
         self.config.reconstruction_alpha = saved_reconstruction_alpha;
         self.config.phase_a_steps = saved_phase_a_steps;
         self.config.phase_b_steps = saved_phase_b_steps;

@@ -108,6 +108,20 @@ CHECKPOINT_INTERVAL_EPOCHS = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_INTERVAL
 RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
 NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "0") == "1"
 FORCE_REBUILD = os.environ.get("JAIDE_BENCH_FORCE_REBUILD", "0") == "1"
+MODEL_INIT_DEADLINE_SEC = int(os.environ.get("JAIDE_BENCH_MODEL_INIT_DEADLINE_SEC", "900"))
+IDLE_OUTPUT_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_IDLE_OUTPUT_SEC", "180"))
+STARTUP_ONLY = os.environ.get("JAIDE_BENCH_STARTUP_ONLY", "0") in ("1", "true", "yes")
+SKIP_KNOWLEDGE_GRAPH_ENV = os.environ.get("JAIDE_SKIP_KNOWLEDGE_GRAPH", "0") in ("1", "true", "yes")
+GRAPH_CHUNK_SIZE_ENV = int(os.environ.get("JAIDE_GRAPH_CHUNK_SIZE", "65536"))
+TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_TRAIN_TIMEOUT_SEC", "72000"))
+if MODEL_INIT_DEADLINE_SEC <= 0:
+    raise ValueError("JAIDE_BENCH_MODEL_INIT_DEADLINE_SEC értékének pozitívnak kell lennie")
+if IDLE_OUTPUT_TIMEOUT_SEC <= 0:
+    raise ValueError("JAIDE_BENCH_IDLE_OUTPUT_SEC értékének pozitívnak kell lennie")
+if TRAIN_TIMEOUT_SEC <= 0:
+    raise ValueError("JAIDE_BENCH_TRAIN_TIMEOUT_SEC értékének pozitívnak kell lennie")
+if GRAPH_CHUNK_SIZE_ENV <= 0 or GRAPH_CHUNK_SIZE_ENV > 16 * 1024 * 1024:
+    raise ValueError("JAIDE_GRAPH_CHUNK_SIZE értékének 1 és 16777216 között kell lennie")
 SKIP_PREP = os.environ.get("JAIDE_BENCH_SKIP_PREP", "0") == "1"
 
 app = modal.App(APP_NAME)
@@ -176,6 +190,226 @@ def _safe_unlink(path: Path) -> None:
             path.unlink()
     except FileNotFoundError:
         return
+
+
+class TrainingStallState:
+    def __init__(self) -> None:
+        self.reason: Optional[str] = None
+        self.phase: str = "startup"
+        self.init_completed: bool = False
+        self.first_step_completed: bool = False
+        self.last_output_time: float = time.monotonic()
+        self.started_time: float = time.monotonic()
+        self.last_line: str = ""
+
+
+TRAINING_PHASE_MARKERS = (
+    ("dataset_load", ("Tokencsorda adathalmaz", "dataset loaded", "dataset_ms=")),
+    ("tokenizer_load", ("Tokenizer loaded", "tokenizer_ms=")),
+    ("futhark_context", ("[FutharkContext]", "Futhark-accelerated")),
+    ("memory_preflight", ("memory preflight",)),
+    ("stack_rsf_allocation", ("stack-only mode initialized", "rsf ownership mode=stack_only")),
+    ("embedding_allocation", ("EmbeddingAccelerator",)),
+    ("frozen_target_allocation", ("FrozenEmbeddingAccelerator",)),
+    ("optimizer_allocation", ("optimizer",)),
+    ("startup_spectral", ("spectral",)),
+    ("checkpoint_restore", ("checkpoint restore", "Checkpoint restored")),
+    ("graph_construction", ("Knowledge graph construction", "graph-construction")),
+    ("training_start", ("Starting Futhark-accelerated training",)),
+    ("training_step", ("[Step ",)),
+)
+
+
+def _advance_phase(state: "TrainingStallState", line: str) -> None:
+    if "completed loss=" in line:
+        state.first_step_completed = True
+        state.init_completed = True
+    for phase_name, markers in reversed(TRAINING_PHASE_MARKERS):
+        for marker in markers:
+            if marker in line:
+                state.phase = phase_name
+                return
+
+
+def _classify_failure(output_text: str, returncode: Optional[int], timed_out: bool, stall: Optional[TrainingStallState]) -> Dict[str, Any]:
+    lowered = output_text.lower()
+    category = "none"
+    detail = ""
+    if timed_out:
+        category = "timeout"
+        detail = "external timeout reached"
+    if stall is not None and stall.reason is not None:
+        category = "timeout" if "deadline" in stall.reason else "idle_stall"
+        detail = stall.reason
+    if "memory preflight rejected" in lowered:
+        category = "memory_preflight_rejected"
+        detail = "estimated peak exceeded free memory minus reserve"
+    elif "cudaerrormemoryallocation" in lowered or "out of memory" in lowered or "cuda oom" in lowered:
+        category = "cuda_oom"
+        for line in output_text.splitlines():
+            if "allocating" in line.lower() and "bytes" in line.lower():
+                detail = line.strip()
+                break
+        if not detail:
+            detail = "CUDA reported an out-of-memory allocation failure"
+    elif "bad_alloc" in lowered or "std::bad_alloc" in lowered or "cannot allocate memory" in lowered:
+        category = "host_oom"
+        detail = "host allocator reported an out-of-memory failure"
+    elif "memory allocation of" in lowered and "bytes failed" in lowered:
+        category = "host_oom"
+        detail = "host allocator reported an out-of-memory failure"
+    elif "futhark" in lowered and "error" in lowered and category in ("none", "timeout"):
+        for line in output_text.splitlines():
+            if "error" in line.lower():
+                detail = line.strip()
+                break
+        category = "runtime_error" if category == "none" else category
+    if category == "none" and returncode is not None:
+        if returncode < 0:
+            category = "signal"
+            detail = f"terminated by signal {-returncode}"
+        elif returncode != 0:
+            category = "abnormal_exit"
+            detail = f"nonzero exit code {returncode}"
+    return {
+        "category": category,
+        "detail": detail,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "phase": stall.phase if stall is not None else None,
+        "model_initialization_completed": stall.init_completed if stall is not None else None,
+    }
+
+
+def _last_gpu_snapshot(monitor_text: str) -> Dict[str, Any]:
+    metrics = _parse_gpu_monitor(monitor_text)
+    snapshot: Dict[str, Any] = {}
+    for key in ("memory_used_max_mib", "memory_total_mib", "utilization_max_percent", "power_max_watts", "sm_clock_max_mhz"):
+        if key in metrics:
+            snapshot[key] = metrics[key]
+    lines = [line for line in monitor_text.splitlines() if line.strip()]
+    if lines:
+        snapshot["last_sample"] = lines[-1]
+    return snapshot
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _build_fingerprint_inputs(project_dir: str) -> List[Tuple[str, str]]:
+    root = Path(project_dir)
+    inputs: List[Tuple[str, str]] = []
+    tracked: List[Path] = [root / "build.zig", root / "build.zig.zon"]
+    for pattern in ("src/**/*.zig", "src/hw/accel/*.fut", "src/hw/accel/futhark.pkg", "src/hw/accel/*.c", "src/hw/accel/*.h", "src/hw/accel/*.json"):
+        tracked.extend(root.glob(pattern))
+    seen = set()
+    for path in sorted(tracked):
+        if not path.is_file():
+            continue
+        resolved = str(path.relative_to(root))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        inputs.append((resolved, _sha256_file(path)))
+    return inputs
+
+
+def _checkpoint_schema_version(project_dir: str) -> str:
+    envelope = Path(project_dir) / "src" / "distributed" / "checkpoint_envelope.zig"
+    if envelope.is_file():
+        for line in envelope.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pub const VERSION"):
+                return stripped.rstrip(";")
+    return "unknown"
+
+
+def _tool_version(command: List[str]) -> str:
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        return (completed.stdout + completed.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+
+
+def _compute_build_fingerprint(project_dir: str, tool_versions: Dict[str, str], build_flags: str, gpu_enabled: bool) -> str:
+    hasher = hashlib.sha256()
+    for name, digest in _build_fingerprint_inputs(project_dir):
+        hasher.update(name.encode("utf-8"))
+        hasher.update(digest.encode("utf-8"))
+    hasher.update(f"zig={tool_versions.get('zig', 'unknown')}".encode("utf-8"))
+    hasher.update(f"futhark={tool_versions.get('futhark', 'unknown')}".encode("utf-8"))
+    hasher.update(f"cuda={tool_versions.get('cuda', 'unknown')}".encode("utf-8"))
+    hasher.update(f"flags={build_flags}".encode("utf-8"))
+    hasher.update(f"gpu={int(gpu_enabled)}".encode("utf-8"))
+    hasher.update(f"checkpoint_schema={_checkpoint_schema_version(project_dir)}".encode("utf-8"))
+    hasher.update(f"gpu_spec={GPU_SPEC}".encode("utf-8"))
+    hasher.update(b"jaide-build-fingerprint-v1")
+    return hasher.hexdigest()
+
+
+def _fingerprint_dir(fingerprint: str) -> Path:
+    return BUILD_MOUNT_PATH / "fingerprints" / fingerprint
+
+
+def _store_fingerprinted_binaries(fingerprint: str, inputs: List[Tuple[str, str]], tool_versions: Dict[str, str], build_flags: str, binaries: List[Path]) -> Dict[str, Any]:
+    target_dir = _fingerprint_dir(fingerprint)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    manifest: Dict[str, Any] = {
+        "fingerprint": fingerprint,
+        "inputs": [{"path": name, "sha256": digest} for name, digest in inputs],
+        "tool_versions": tool_versions,
+        "build_flags": build_flags,
+        "binaries": {},
+    }
+    for binary in binaries:
+        if binary.is_file() and binary.stat().st_size > 0:
+            shutil.copy2(str(binary), str(target_dir / binary.name))
+            os.chmod(str(target_dir / binary.name), 0o755)
+            manifest["binaries"][binary.name] = _sha256_file(target_dir / binary.name)
+    manifest_path = target_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest
+
+
+def _find_fingerprinted_binary(name: str, fingerprint: str) -> Optional[Path]:
+    target_dir = _fingerprint_dir(fingerprint)
+    manifest_path = target_dir / "manifest.json"
+    binary_path = target_dir / name
+    if not manifest_path.is_file() or not binary_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    recorded = manifest.get("binaries", {}).get(name)
+    if not isinstance(recorded, str):
+        return None
+    try:
+        if _sha256_file(binary_path) != recorded:
+            return None
+    except OSError:
+        return None
+    return binary_path
+
+
+def _futhark_cache_key(project_dir: str, tool_versions: Dict[str, str]) -> str:
+    hasher = hashlib.sha256()
+    root = Path(project_dir) / "src" / "hw" / "accel"
+    tracked = sorted(list(root.glob("*.fut")) + list(root.glob("futhark.pkg")) + list(root.glob("*.json")))
+    for path in tracked:
+        if path.is_file():
+            hasher.update(path.name.encode("utf-8"))
+            hasher.update(_sha256_file(path).encode("utf-8"))
+    hasher.update(f"futhark={tool_versions.get('futhark', 'unknown')}".encode("utf-8"))
+    hasher.update(f"gpu_spec={GPU_SPEC}".encode("utf-8"))
+    hasher.update(b"jaide-futhark-cache-v2")
+    return hasher.hexdigest()
 
 
 def _find_latest_binary(name: str) -> Optional[Path]:
@@ -319,6 +553,8 @@ def _run_multirank(
     num_gpus: int,
     nccl_id_path: str,
     timeout: int,
+    stall_state: Optional[TrainingStallState] = None,
+    startup_only: bool = False,
 ) -> Tuple[int, str, float]:
     if num_gpus <= 0:
         raise ValueError("A GPU-k számának legalább 1-nek kell lennie")
@@ -347,6 +583,7 @@ def _run_multirank(
     output_chunks: List[bytes] = []
     selector = selectors.DefaultSelector()
     timed_out = False
+    stall_state_terminated = False
 
     try:
         for rank_index in range(num_gpus):
@@ -406,6 +643,45 @@ def _run_multirank(
                 for line in chunk.splitlines(keepends=True):
                     sys.stdout.buffer.write(prefix + line)
                 sys.stdout.buffer.flush()
+                if stall_state is not None:
+                    stall_state.last_output_time = time.monotonic()
+                    text_chunk = chunk.decode("utf-8", errors="replace")
+                    last_line = text_chunk.splitlines()[-1] if text_chunk.splitlines() else stall_state.last_line
+                    stall_state.last_line = last_line
+                    for chunk_line in text_chunk.splitlines():
+                        _advance_phase(stall_state, chunk_line)
+                    if startup_only and stall_state.first_step_completed:
+                        stall_state.reason = "startup-only validation reached first completed training step"
+                        for proc in procs:
+                            _terminate_process_group(proc)
+                        stall_state_terminated = True
+                        break
+
+            if stall_state is not None and stall_state.reason is None:
+                if not stall_state.init_completed:
+                    if time.monotonic() - stall_state.started_time > MODEL_INIT_DEADLINE_SEC:
+                        stall_state.reason = (
+                            f"model initialization deadline ({MODEL_INIT_DEADLINE_SEC}s) exceeded in phase '{stall_state.phase}'"
+                        )
+                        for proc in procs:
+                            _terminate_process_group(proc)
+                        stall_state_terminated = True
+                    elif time.monotonic() - stall_state.last_output_time > IDLE_OUTPUT_TIMEOUT_SEC:
+                        stall_state.reason = (
+                            f"no output for {IDLE_OUTPUT_TIMEOUT_SEC}s during initialization phase '{stall_state.phase}'; last line: {stall_state.last_line}"
+                        )
+                        for proc in procs:
+                            _terminate_process_group(proc)
+                        stall_state_terminated = True
+                elif time.monotonic() - stall_state.last_output_time > max(IDLE_OUTPUT_TIMEOUT_SEC, 600):
+                    stall_state.reason = (
+                        f"no output for {max(IDLE_OUTPUT_TIMEOUT_SEC, 600)}s in phase '{stall_state.phase}'; last line: {stall_state.last_line}"
+                    )
+                    for proc in procs:
+                        _terminate_process_group(proc)
+                    stall_state_terminated = True
+            if stall_state_terminated:
+                break
 
         for proc in procs:
             if proc.poll() is None:
@@ -427,6 +703,9 @@ def _run_multirank(
     _log(f"<<< több-GPU futtatás GPU-szám={num_gpus} kódok={returncodes} időtartam={dt:.2f}s")
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=combined_out.encode("utf-8"))
+    if stall_state is not None and stall_state.reason is not None:
+        _log(f"!!! futtatási őrfigyelő leállította a folyamatokat: {stall_state.reason}")
+        return 0 if stall_state.first_step_completed else 1, combined_out, dt
     return combined_rc, combined_out, dt
 
 
@@ -641,13 +920,29 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     )
 
     dataset_path = Path(DATASET_PATH)
-    existing_dist = _find_latest_binary("jaide-distributed-futhark")
-    existing_inf = _find_latest_binary("jaide-inference-server")
+    tool_versions = {
+        "zig": _tool_version(["zig", "version"]),
+        "futhark": _tool_version(["futhark", "--version"]),
+        "cuda": _tool_version(["nvcc", "--version"]),
+    }
+    build_flags = "inference=-Dgpu=false:-Doptimize=ReleaseSafe:-Dskip-futhark=true;distributed=-Dgpu=true:-Doptimize=ReleaseSafe:-Dskip-futhark=true"
+    build_fingerprint = _compute_build_fingerprint(project_dir, tool_versions, build_flags, True)
+    result["build_fingerprint"] = build_fingerprint
+    result["build_fingerprint_tool_versions"] = tool_versions
+    existing_dist = _find_fingerprinted_binary("jaide-distributed-futhark", build_fingerprint)
+    existing_inf = _find_fingerprinted_binary("jaide-inference-server", build_fingerprint)
+    if not FORCE_REBUILD and existing_dist and existing_inf:
+        _log(f"Tartalomcimzett binaris ujrahasznositas (fingerprint={build_fingerprint[:16]}): {existing_dist}")
+        _log(f"Tartalomcimzett inferencia binaris ujrahasznositas: {existing_inf}")
+    elif FORCE_REBUILD:
+        _log("JAIDE_BENCH_FORCE_REBUILD=1: az ujrahasznositas kiiktatva, kotelezo ujraforditas")
+    else:
+        _log("Nincs ellenorzott fingerprint egyezes: a binarisok ujra lesznek forditva")
     dataset_exists = dataset_path.exists() and dataset_path.stat().st_size > 0
 
     if not FORCE_REBUILD and existing_dist and existing_inf and dataset_exists:
-        _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
-        _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
+        _log(f"Ujrahasznosithato binaris megtalalva: {existing_dist}")
+        _log(f"Ujrahasznosithato inferencia binaris megtalalva: {existing_inf}")
         _log("Az újrafordítás és az adathalmaz letöltése átugorva, azonnali indítás.")
 
         build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
@@ -732,6 +1027,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         "inference_build_returncode": rc_b,
         "distributed_build_returncode": rc_b_dist,
         "duration_s": round(time.time() - t0, 2),
+        "build_fingerprint": build_fingerprint,
     }
     _write_report(
         report_dir,
@@ -767,6 +1063,15 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     else:
         result["inference_binary_present"] = False
         _log(f"FIGYELMEZTETÉS: az inferencia bináris nem épült fel itt: {inference_bin}")
+
+    _store_fingerprinted_binaries(
+        build_fingerprint,
+        _build_fingerprint_inputs(project_dir),
+        tool_versions,
+        build_flags,
+        [path for path in (distributed_bin, inference_bin) if path.exists()],
+    )
+    _log(f"Binárisok tartalomcimzett tarolasa megtortent: {_fingerprint_dir(build_fingerprint)}")
 
     _log("=" * 70)
     _log(f"C-előkészítő fázis: adathalmaz letöltése ({SAMPLE_CAP} minta)")
@@ -969,11 +1274,21 @@ def run_gpu_train_and_infer(
         train_env["NCCL_NVLS_ENABLE"] = "0"
         train_env["CUDA_DEVICE_ORDER"] = CUDA_DEVICE_ORDER
         train_env["JAIDE_RELATIONAL_FAST"] = JAIDE_RELATIONAL_FAST
-        cache_hasher = hashlib.sha256()
-        cache_hasher.update((PROJECT_MOUNT_PATH / "src/hw/accel/main.fut").read_bytes())
-        cache_hasher.update(b"futhark-0.26.4-cuda-sm100")
-        futhark_cache_path = CHECKPOINT_MOUNT_PATH / f"futhark_gpu_cache_{cache_hasher.hexdigest()[:20]}.bin"
+        gpu_tool_versions = {
+            "zig": _tool_version(["zig", "version"]),
+            "futhark": _tool_version(["futhark", "--version"]),
+            "cuda": _tool_version(["nvcc", "--version"]),
+        }
+        futhark_cache_key = _futhark_cache_key(str(PROJECT_MOUNT_PATH), gpu_tool_versions)
+        futhark_cache_path = CHECKPOINT_MOUNT_PATH / f"futhark_gpu_cache_{futhark_cache_key[:20]}.bin"
         train_env["JAIDE_FUTHARK_CACHE"] = str(futhark_cache_path)
+        train_env["JAIDE_FUTHARK_UNIFIED_MEMORY"] = os.environ.get("JAIDE_FUTHARK_UNIFIED_MEMORY", "0")
+        if SKIP_KNOWLEDGE_GRAPH_ENV:
+            train_env["JAIDE_SKIP_KNOWLEDGE_GRAPH"] = "1"
+        else:
+            train_env.pop("JAIDE_SKIP_KNOWLEDGE_GRAPH", None)
+        train_env["JAIDE_GRAPH_CHUNK_SIZE"] = str(GRAPH_CHUNK_SIZE_ENV)
+        _log(f"Futhark GPU cache kulcs: {futhark_cache_key[:20]} (minden .fut forras + futhark verzio + gpu spec)")
 
         _clear_rank_coordination_files(nccl_id_path)
 
@@ -1012,6 +1327,7 @@ def run_gpu_train_and_infer(
         )
         t0 = time.time()
         training_started_ns = time.time_ns()
+        stall_state = TrainingStallState()
         try:
             rc_c, out_c, _ = _run_multirank(
                 cmd=training_command,
@@ -1019,7 +1335,9 @@ def run_gpu_train_and_infer(
                 base_env=train_env,
                 num_gpus=NUM_GPUS,
                 nccl_id_path=nccl_id_path,
-                timeout=72000,
+                timeout=TRAIN_TIMEOUT_SEC,
+                stall_state=stall_state,
+                startup_only=STARTUP_ONLY,
             )
         finally:
             _terminate_process_group(monitor_process)
@@ -1027,9 +1345,28 @@ def run_gpu_train_and_infer(
             monitor_file.close()
         phase_c_duration = time.time() - t0
         training_succeeded = rc_c == 0
+        if STARTUP_ONLY:
+            _log("Inditasi-only validacio: az elso befejezett lepes utan a futtas leallt")
+        failure_summary = _classify_failure(out_c, rc_c, False, stall_state)
+        failure_summary["phase_c_duration_s"] = round(phase_c_duration, 2)
+        failure_summary["train_timeout_sec"] = TRAIN_TIMEOUT_SEC
+        failure_summary["model_init_deadline_sec"] = MODEL_INIT_DEADLINE_SEC
+        failure_summary["idle_output_timeout_sec"] = IDLE_OUTPUT_TIMEOUT_SEC
+        if not training_succeeded or failure_summary["category"] not in ("none", None):
+            _write_report(report_dir, "phase_c_error_summary.json", json.dumps(failure_summary, indent=2, sort_keys=True))
+            _log(
+                "Hibaklasszifikacio: kategoria={category} fazis={phase} reszlet={detail}".format(
+                    category=failure_summary["category"],
+                    phase=failure_summary.get("phase"),
+                    detail=failure_summary.get("detail"),
+                )
+            )
         gpu_monitor_text = monitor_path.read_text(encoding="utf-8") if monitor_path.exists() else ""
         gpu_monitor_metrics = _parse_gpu_monitor(gpu_monitor_text)
         _write_report(report_dir, "phase_c_gpu_monitor.csv", gpu_monitor_text)
+        failure_summary["last_gpu_state"] = _last_gpu_snapshot(gpu_monitor_text)
+        if not training_succeeded or failure_summary["category"] not in ("none", None):
+            _write_report(report_dir, "phase_c_error_summary.json", json.dumps(failure_summary, indent=2, sort_keys=True))
 
         loss_curve: List[Tuple[int, float]] = []
         recon_curve: List[Tuple[int, float]] = []
